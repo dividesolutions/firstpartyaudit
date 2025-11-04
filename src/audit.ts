@@ -1,212 +1,178 @@
+// src/audit.ts
 import { chromium } from "playwright";
 
-export async function runAudit(url: string) {
-  const browser = await chromium.launch({ headless: true });
+export async function runAudit(targetUrl: string) {
+  const browser = await chromium.launch({ headless: true, args: ["--no-sandbox"] });
+  const context = await browser.newContext();
+  const page = await context.newPage();
 
-  try {
-    const context = await browser.newContext();
-    const page = await context.newPage();
+  const base = new URL(targetUrl);
+  const baseDomain = base.hostname.split(".").slice(-2).join(".");
 
-    // --- Collect network beacons ---
-    const beacons: any[] = [];
-    page.on("response", (resp) => {
-      try {
-        beacons.push({
-          url: resp.url(),
-          status: resp.status(),
-          type: resp.request().resourceType(),
-        });
-      } catch (_) {}
-    });
+  // --- tracking counters
+  let totalBeacons = 0;
+  let clientSideEvents = 0;
+  let serverSideEvents = 0;
+  const detectedServerDomains = new Set<string>();
 
-    console.log("🌐 Navigating to", url);
-    const start = Date.now();
-    await page.goto(url, { waitUntil: "load", timeout: 90000 });
-    await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
-    const loadTimeMS = Date.now() - start;
+  // --- cookie storage
+  const allServerCookies: any[] = [];
+  const browserCookies: any[] = [];
 
-    // --- Title & Performance ---
-    let title = "Unknown Title";
-    try {
-      title = await page.title();
-    } catch (_) {}
+  // --- detection patterns
+  const serverSideKeywords = ["track", "data", "events", "analytics", "measure", "collect", "t", "cookies", "pixel", "ss"];
+  const excludedPaths = ["/cdn/", "/shop/", "/assets/", "/theme", "observer.js", "bundle.js"];
 
-    const cookies = await context.cookies().catch(() => []);
-    const perfEntries = await page.evaluate(() => performance.getEntries()).catch(() => []);
-    const transferSizeKB = Math.round(perfEntries.length * 10);
-
-   // --- Consent Detection + Vendor Identification ---
-let consentBannerText = "";
-let hasConsentBanner = false;
-let consentVendor: string | null = null;
-
-try {
-  const banner = await page.$(
-    '[id*="consent"], [id*="cookie"], [class*="consent"], [class*="cookie"], div[role="dialog"]'
-  );
-  if (banner) {
-    const visible = await banner.isVisible().catch(() => false);
-    if (visible) {
-      hasConsentBanner = true;
-      consentBannerText = (await banner.textContent())?.trim().slice(0, 180) || "";
-    }
-  }
-
-  // --- Vendor fingerprints ---
-  const html = await page.content();
-  const vendorPatterns: Record<string, RegExp[]> = {
-    OneTrust: [/onetrust/i, /optanon/i],
-    Cookiebot: [/cookiebot/i],
-    Usercentrics: [/usercentrics/i],
-    iubenda: [/iubenda/i],
-    Quantcast: [/quantcast/i, /choice\.quantcast/i],
-    TrustArc: [/trustarc/i],
-    CookieYes: [/cookieyes/i],
+  const PLATFORM_PATTERNS: Record<string, RegExp[]> = {
+    Facebook: [/facebook\.com/, /fbp/, /fbc/],
+    Google: [/google\.com/, /gcl_/, /_ga/, /_gid/],
+    TikTok: [/tiktok\.com/, /tt_/, /_ttp/],
+    Klaviyo: [/klaviyo\.com/, /_kla_id/],
+    Pinterest: [/pinterest\.com/, /_pin_/, /_pinterest/],
+    Snap: [/snapchat\.com/, /sc_/, /_scid/],
+    Other: [],
   };
 
-  for (const [vendor, patterns] of Object.entries(vendorPatterns)) {
-    if (patterns.some((rx) => rx.test(html) || beacons.some((b) => rx.test(b.url)))) {
-      consentVendor = vendor;
-      break;
-    }
-  }
-} catch (_) {}
+  // --- network listener
+  page.on("response", async (resp) => {
+    try {
+      const url = new URL(resp.url());
+      const headers = await resp.allHeaders();
 
-// Determine if cookies already exist before consent
-const preConsentCookies = cookies.filter(
-  (c) => !/consent|banner|policy/i.test(c.name)
-);
-const autoDropsCookiesBeforeConsent = hasConsentBanner && preConsentCookies.length > 0;
-
-const consent = {
-  hasConsentBanner,
-  bannerText: consentBannerText,
-  autoDropsCookiesBeforeConsent,
-  vendor: consentVendor,
-};
-
-    // --- Server-side / First-party classifier ---
-    const rootDomain = new URL(url).hostname
-      .replace(/^www\./, "")
-      .split(".")
-      .slice(-2)
-      .join(".");
-    const serverSidePattern = new RegExp(
-      `(sgtm|server|capi|ss\\.|data\\.${rootDomain}|track\\.${rootDomain}|events\\.${rootDomain}|api\\.${rootDomain})`,
-      "i"
-    );
-
-    const hasServerSide = beacons.some((b) => serverSidePattern.test(b.url));
-    const serverSideEvents = beacons.filter((b) => serverSidePattern.test(b.url));
-    const clientEvents = beacons.filter((b) => !serverSidePattern.test(b.url));
-    const serverDomainSamples = serverSideEvents.slice(0, 5).map((b) => b.url);
-
-    // --- Cookie breakdown ---
-    const firstPartyCookies = cookies.filter((c) =>
-      c.domain.includes(new URL(url).hostname)
-    );
-    const thirdPartyCookies = cookies.filter(
-      (c) => !c.domain.includes(new URL(url).hostname)
-    );
-    const insecureCookies = cookies.filter((c) => !c.secure || c.sameSite === "None");
-
-    // --- Tracker vendors ---
-    const trackers = beacons.filter((b) =>
-      /(facebook|google|tiktok|snapchat|klaviyo|analytics)/i.test(b.url)
-    );
-    const trackerVendors = Array.from(
-      new Set(
-        trackers.map((t) => {
-          if (t.url.includes("facebook")) return "Facebook";
-          if (t.url.includes("google")) return "Google";
-          if (t.url.includes("tiktok")) return "TikTok";
-          if (t.url.includes("snapchat")) return "Snapchat";
-          if (t.url.includes("klaviyo")) return "Klaviyo";
-          return "Other";
-        })
-      )
-    );
-
-    // --- Shopify app fingerprinting ---
-    const appFingerprints: Record<string, RegExp[]> = {
-      Klaviyo: [/static\.klaviyo\.com/, /a\.klaviyo\.com/],
-      JudgeMe: [/cdn\.judge\.me/],
-      Yotpo: [/yotpo\.com/],
-      Okendo: [/okendo\.io/],
-      ReConvert: [/reconvert\.io/],
-      Stape: [/sgtm\./, /stape\.io/],
-    };
-    const shopifyAppsDetected: string[] = [];
-    for (const [name, patterns] of Object.entries(appFingerprints)) {
-      if (patterns.some((rx) => beacons.some((b) => rx.test(b.url)))) {
-        shopifyAppsDetected.push(name);
+      // --- capture server-set cookies
+      if (headers["set-cookie"]) {
+        const cookieList = headers["set-cookie"].split(",");
+        cookieList.forEach((c) => {
+          const cookieDomain = url.hostname.toLowerCase();
+          const isFirstParty = cookieDomain.endsWith(baseDomain);
+          const fromServerSubdomain = /^(data|track|events|analytics)\./.test(cookieDomain);
+          allServerCookies.push({
+            cookie: c.split(";")[0].trim(),
+            domain: cookieDomain,
+            isFirstParty,
+            fromServerSubdomain,
+            source: "server-set",
+          });
+        });
       }
+
+      // --- classify requests
+      const hostname = url.hostname.toLowerCase();
+      const pathname = url.pathname.toLowerCase();
+      totalBeacons++;
+
+      const isFirstPartyServer =
+        serverSideKeywords.some(
+          (k) => hostname.startsWith(k + ".") || pathname.includes("/" + k)
+        ) &&
+        !excludedPaths.some((x) => pathname.includes(x) || hostname.includes("cdn"));
+
+      if (isFirstPartyServer) {
+        serverSideEvents++;
+        detectedServerDomains.add(resp.url());
+      } else if (hostname.endsWith(baseDomain)) {
+        clientSideEvents++;
+      }
+    } catch {
+      /* ignore parsing issues */
     }
+  });
 
-    // --- Scoring ---
-    const scoreTech = 70;
-    let scoreBias = 60;
-    let diagnosis = "Mixed setup";
+  // --- load page
+  const start = Date.now();
+  await page.goto(targetUrl, { waitUntil: "networkidle", timeout: 60000 });
+  const loadTimeMS = Date.now() - start;
 
-    if (!hasServerSide) {
-      scoreBias = 25;
-      diagnosis = "Client-side only";
-    } else {
-      scoreBias = 92;
-      diagnosis = "Server-side tracking detected";
+  // --- collect cookies visible to browser
+  const cookies = await context.cookies();
+  cookies.forEach((c) => browserCookies.push(c));
+
+  // --- correlate with server-set cookies
+  browserCookies.forEach((c) => {
+    const match = allServerCookies.find((s) => c.name === s.cookie.split("=")[0]);
+    c.setByServer = match ? match.domain : null;
+    c.isFirstPartyServerCookie = match ? match.fromServerSubdomain : false;
+  });
+
+  // --- detect ad / analytics platform for each cookie
+  function detectPlatform(cookieName: string, cookieDomain: string): string {
+    for (const [platform, patterns] of Object.entries(PLATFORM_PATTERNS)) {
+      if (patterns.some((re) => re.test(cookieName) || re.test(cookieDomain))) return platform;
     }
-    if (insecureCookies.length > 0) scoreBias -= 5;
-    if (autoDropsCookiesBeforeConsent) scoreBias -= 5; // privacy penalty
-
-    const scorePotential = 95;
-
-    // --- Return clean JSON ---
-    return {
-      summary: { url, title, timestamp: new Date().toISOString() },
-      performance: { loadTimeMS, transferSizeKB },
-      tracking: {
-        trackerVendors,
-        shopifyAppsDetected,
-        beaconBreakdown: {
-          client: clientEvents.length,
-          server: serverSideEvents.length,
-          total: beacons.length,
-        },
-        serverDomainsDetected: serverDomainSamples,
-      },
-      cookies: {
-        firstParty: firstPartyCookies.length,
-        thirdParty: thirdPartyCookies.length,
-        insecure: insecureCookies.length,
-      },
-      consent,
-      scores: {
-        technical: scoreTech,
-        firstPartyBias: Math.max(0, Math.min(100, scoreBias)),
-        potentialWithFirstParty: scorePotential,
-      },
-      insights: {
-        diagnosis,
-        opportunity:
-          diagnosis === "Client-side only"
-            ? "High ROI potential with server-side tagging"
-            : "Strong foundation; minor improvements possible",
-        notes: [
-          insecureCookies.length
-            ? `${insecureCookies.length} cookies lack Secure or SameSite flags.`
-            : "Cookie hygiene looks solid.",
-          hasConsentBanner
-            ? autoDropsCookiesBeforeConsent
-              ? "Cookies are being dropped before user consent (compliance risk)."
-              : "Consent banner detected and functioning."
-            : "No consent mechanism detected."
-        ].join(" "),
-      },
-    };
-  } catch (err: any) {
-    console.error("❌ Audit error:", err);
-    throw new Error(err.message || "Audit failed");
-  } finally {
-    await browser.close().catch(() => {});
+    return "Other";
   }
+
+  browserCookies.forEach((c) => {
+    c.platform = detectPlatform(c.name, c.domain);
+  });
+
+  // --- cookie metrics
+  const firstPartyCookies = browserCookies.filter((c) => c.domain.includes(baseDomain));
+  const thirdPartyCookies = browserCookies.filter((c) => !c.domain.includes(baseDomain));
+  const insecureCookies = browserCookies.filter(
+    (c) => c.sameSite === "None" || !c.secure
+  );
+  const serverSetCookies = browserCookies.filter((c) => c.setByServer);
+  const firstPartyServerCookies = browserCookies.filter((c) => c.isFirstPartyServerCookie);
+
+  // --- cookies by platform
+  const cookiesByPlatform: Record<string, { firstParty: number; thirdParty: number }> = {};
+  browserCookies.forEach((c) => {
+    const platform = c.platform || "Other";
+    const isFirst = c.domain.includes(baseDomain);
+    if (!cookiesByPlatform[platform]) cookiesByPlatform[platform] = { firstParty: 0, thirdParty: 0 };
+    if (isFirst) cookiesByPlatform[platform].firstParty++;
+    else cookiesByPlatform[platform].thirdParty++;
+  });
+
+  // --- scoring
+  const cookieHealthScore =
+    (firstPartyServerCookies.length / (browserCookies.length || 1)) * 100;
+
+  const scores = {
+    technical: Math.min(100, 50 + cookieHealthScore / 2),
+    firstPartyBias: Math.min(100, 70 + firstPartyServerCookies.length),
+    potentialWithFirstParty: 95,
+  };
+
+  // --- output JSON
+  const result = {
+    summary: {
+      url: targetUrl,
+      title: await page.title(),
+      timestamp: new Date().toISOString(),
+    },
+    performance: {
+      loadTimeMS,
+      transferSizeKB: Math.round((await page.content()).length / 1024),
+    },
+    tracking: {
+      beaconBreakdown: { client: clientSideEvents, server: serverSideEvents, total: totalBeacons },
+      serverDomainsDetected: Array.from(detectedServerDomains),
+    },
+    cookies: {
+      total: browserCookies.length,
+      firstParty: firstPartyCookies.length,
+      thirdParty: thirdPartyCookies.length,
+      insecure: insecureCookies.length,
+      serverSet: serverSetCookies.length,
+      firstPartyServerSet: firstPartyServerCookies.length,
+      byPlatform: cookiesByPlatform,
+    },
+    scores,
+    insights: {
+      diagnosis:
+        serverSideEvents > 0
+          ? "Server-side tracking detected"
+          : "Client-side only tracking",
+      opportunity:
+        firstPartyServerCookies.length > 0
+          ? "Strong foundation; minor improvements possible"
+          : "Significant opportunity to implement first-party tracking",
+      notes: `${insecureCookies.length} cookies lack Secure or SameSite flags.`,
+    },
+  };
+
+  await browser.close();
+  return result;
 }

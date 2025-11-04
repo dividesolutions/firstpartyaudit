@@ -9,17 +9,17 @@ export async function runAudit(targetUrl: string) {
   const base = new URL(targetUrl);
   const baseDomain = base.hostname.split(".").slice(-2).join(".");
 
-  // counters
+  // Counters
   let totalBeacons = 0;
   let clientSideEvents = 0;
   let serverSideEvents = 0;
   const detectedServerDomains = new Set<string>();
 
-  // cookie stores
+  // Storage
   const allServerCookies: any[] = [];
   const browserCookies: any[] = [];
 
-  // ad-platform patterns
+  // --- Platform patterns
   const PLATFORM_PATTERNS: Record<string, RegExp[]> = {
     Facebook: [/facebook\.com/, /fbp/, /fbc/],
     Google: [/google\.com/, /gcl_/, /_ga/, /_gid/],
@@ -30,17 +30,17 @@ export async function runAudit(targetUrl: string) {
     Other: [],
   };
 
-  // strict subdomain allow-list for true first-party servers
+  // --- True first-party server subdomain patterns
   const firstPartyPatterns = (process.env.FIRST_PARTY_PATTERNS ||
     "data,track,events,analytics,measure")
     .split(",")
     .map((s) => s.trim().toLowerCase());
 
-  const firstPartyRegex = new RegExp(
+  const trueFirstPartyRegex = new RegExp(
     `^(${firstPartyPatterns.join("|")})\\.${baseDomain.replace(".", "\\.")}$`
   );
 
-  // listen for network responses
+  // --- Network listener
   page.on("response", async (resp) => {
     try {
       const url = new URL(resp.url());
@@ -48,25 +48,23 @@ export async function runAudit(targetUrl: string) {
       const hostname = url.hostname.toLowerCase();
       totalBeacons++;
 
-      // ---- capture server-set cookies ----
+      // Capture server-set cookies
       if (headers["set-cookie"]) {
         const cookieList = headers["set-cookie"].split(",");
         cookieList.forEach((c) => {
           const cookieDomain = hostname;
-          const isFirstParty = cookieDomain.endsWith(baseDomain);
-          const fromServerSubdomain = firstPartyRegex.test(cookieDomain);
+          const fromServerSubdomain = trueFirstPartyRegex.test(cookieDomain);
           allServerCookies.push({
             cookie: c.split(";")[0].trim(),
             domain: cookieDomain,
-            isFirstParty,
             fromServerSubdomain,
             source: "server-set",
           });
         });
       }
 
-      // ---- classify request ----
-      const isBrandOwnedSubdomain = firstPartyRegex.test(hostname);
+      // Classify request
+      const isBrandOwnedSubdomain = trueFirstPartyRegex.test(hostname);
       const isClearlyThirdParty =
         !hostname.endsWith(baseDomain) || hostname === baseDomain;
 
@@ -81,53 +79,61 @@ export async function runAudit(targetUrl: string) {
     }
   });
 
-  // ---- load the page ----
+  // --- Load the page
   const start = Date.now();
   await page.goto(targetUrl, { waitUntil: "networkidle", timeout: 60000 });
   const loadTimeMS = Date.now() - start;
 
-  // ---- collect browser cookies ----
+  // --- Collect cookies visible to the browser
   const cookies = await context.cookies();
   cookies.forEach((c) => browserCookies.push(c));
 
-  // ---- correlate cookies with server-set cookies ----
+  // --- Correlate cookies with server-set cookies
   browserCookies.forEach((c) => {
     const match = allServerCookies.find((s) => c.name === s.cookie.split("=")[0]);
     c.setByServer = match ? match.domain : null;
     c.isFirstPartyServerCookie = match ? match.fromServerSubdomain : false;
   });
 
-  // ---- detect ad / analytics platform ----
+  // --- Detect ad / analytics platform
   function detectPlatform(cookieName: string, cookieDomain: string): string {
     for (const [platform, patterns] of Object.entries(PLATFORM_PATTERNS)) {
       if (patterns.some((re) => re.test(cookieName) || re.test(cookieDomain))) return platform;
     }
     return "Other";
   }
-
   browserCookies.forEach((c) => (c.platform = detectPlatform(c.name, c.domain)));
 
-  // ---- cookie metrics ----
-  const firstPartyCookies = browserCookies.filter((c) => c.domain.endsWith(baseDomain));
-  const thirdPartyCookies = browserCookies.filter((c) => !c.domain.endsWith(baseDomain));
+  // ---- Cookie metrics (redefined)
+  const firstPartyServerCookies = browserCookies.filter(
+    (c) => c.isFirstPartyServerCookie && trueFirstPartyRegex.test(c.domain)
+  );
+
+  const firstPartyCookies = browserCookies.filter((c) =>
+    trueFirstPartyRegex.test(c.domain)
+  );
+
+  const thirdPartyCookies = browserCookies.filter(
+    (c) => !trueFirstPartyRegex.test(c.domain)
+  );
+
   const insecureCookies = browserCookies.filter(
     (c) => c.sameSite === "None" || !c.secure
   );
   const serverSetCookies = browserCookies.filter((c) => c.setByServer);
-  const firstPartyServerCookies = browserCookies.filter((c) => c.isFirstPartyServerCookie);
 
-  // ---- cookies by platform ----
+  // ---- Cookies by platform (using new first-party logic)
   const cookiesByPlatform: Record<string, { firstParty: number; thirdParty: number }> = {};
   browserCookies.forEach((c) => {
     const platform = c.platform || "Other";
-    const isFirst = c.domain.endsWith(baseDomain);
+    const isTrueFirstParty = trueFirstPartyRegex.test(c.domain);
     if (!cookiesByPlatform[platform])
       cookiesByPlatform[platform] = { firstParty: 0, thirdParty: 0 };
-    if (isFirst) cookiesByPlatform[platform].firstParty++;
+    if (isTrueFirstParty) cookiesByPlatform[platform].firstParty++;
     else cookiesByPlatform[platform].thirdParty++;
   });
 
-  // ---- scoring ----
+  // ---- Scoring
   const cookieHealthScore =
     (firstPartyServerCookies.length / (browserCookies.length || 1)) * 100;
   const scores = {
@@ -136,7 +142,7 @@ export async function runAudit(targetUrl: string) {
     potentialWithFirstParty: 95,
   };
 
-  // ---- output JSON ----
+  // ---- JSON output
   const result = {
     summary: {
       url: targetUrl,

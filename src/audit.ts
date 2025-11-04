@@ -79,10 +79,17 @@ export async function runAudit(targetUrl: string) {
     }
   });
 
-  // --- Load the page
-  const start = Date.now();
-  await page.goto(targetUrl, { waitUntil: "networkidle", timeout: 60000 });
-  const loadTimeMS = Date.now() - start;
+// --- Load the page with safer timing ---
+const start = Date.now();
+try {
+  await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
+  // Attempt to wait for quieter network for up to 15s, ignore timeout
+  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+} catch (err) {
+  console.warn(`⚠️ Navigation warning for ${targetUrl}:`, (err as Error).message);
+}
+const loadTimeMS = Date.now() - start;
+
 
   // --- Collect cookies visible to the browser
   const cookies = await context.cookies();

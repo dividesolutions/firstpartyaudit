@@ -30,7 +30,7 @@ export async function runAudit(targetUrl: string) {
     Other: [],
   };
 
-  // --- True first-party server subdomain patterns (you already included ss, etc.)
+  // --- True first-party server subdomain patterns (already includes ss, etc.)
   const firstPartyPatterns = (process.env.FIRST_PARTY_PATTERNS ||
     "data,track,events,analytics,measure,stats,metrics,collect,collector,t,ss,sgtm,tagging,gtm")
     .split(",")
@@ -48,16 +48,27 @@ export async function runAudit(targetUrl: string) {
       const hostname = url.hostname.toLowerCase();
       totalBeacons++;
 
-      // Capture server-set cookies
+      // Capture server-set cookies (including Domain= attr from Set-Cookie)
       if (headers["set-cookie"]) {
-        const cookieList = headers["set-cookie"].split(",");
-        cookieList.forEach((c) => {
-          const cookieDomain = hostname;
-          const fromServerSubdomain = trueFirstPartyRegex.test(cookieDomain);
+        const rawCookies = headers["set-cookie"]
+          .split(/,(?=[^ ;]+=)/) // safer split for multiple cookies
+          .map((c) => c.trim());
+
+        rawCookies.forEach((c) => {
+          const parts = c.split(";");
+          const nameValue = parts.shift()?.trim() || "";
+          const domainAttr = parts.find((p) => p.trim().toLowerCase().startsWith("domain="));
+          const cookieDomain = domainAttr
+            ? domainAttr.split("=")[1].trim().replace(/^\./, "").toLowerCase()
+            : url.hostname.toLowerCase();
+
+          const fromServerSubdomain = trueFirstPartyRegex.test(url.hostname);
+
           allServerCookies.push({
-            cookie: c.split(";")[0].trim(),
+            cookie: nameValue,
             domain: cookieDomain,
             fromServerSubdomain,
+            setBy: url.hostname,
             source: "server-set",
           });
         });
@@ -95,9 +106,16 @@ export async function runAudit(targetUrl: string) {
 
   // --- Correlate cookies with server-set cookies
   browserCookies.forEach((c) => {
-    const match = allServerCookies.find((s) => c.name === s.cookie.split("=")[0]);
-    c.setByServer = match ? match.domain : null;
-    c.isFirstPartyServerCookie = match ? match.fromServerSubdomain : false;
+    const match = allServerCookies.find(
+      (s) =>
+        c.name === s.cookie.split("=")[0] &&
+        (c.domain.includes(s.domain) || s.domain.includes(baseDomain))
+    );
+    if (match) {
+      c.setByServer = match.setBy;
+      c.isFirstPartyServerCookie =
+        match.fromServerSubdomain || trueFirstPartyRegex.test(match.setBy);
+    }
   });
 
   // --- Detect ad / analytics platform
@@ -128,7 +146,7 @@ export async function runAudit(targetUrl: string) {
 
   // ---- Cookie metrics (redefined)
   const firstPartyServerCookies = browserCookies.filter(
-    (c) => c.isFirstPartyServerCookie && trueFirstPartyRegex.test(c.domain)
+    (c) => c.isFirstPartyServerCookie && c.domain.endsWith(baseDomain)
   );
 
   const firstPartyCookies = browserCookies.filter(
@@ -153,6 +171,7 @@ export async function runAudit(targetUrl: string) {
   browserCookies.forEach((c) => {
     const platform = c.platform || "Other";
     const isTrueFirstParty =
+      c.isFirstPartyServerCookie ||
       trueFirstPartyRegex.test(c.domain) ||
       serverDomainsList.some((h) => c.domain.includes(h.split(".")[0]));
     if (!cookiesByPlatform[platform])

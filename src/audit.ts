@@ -9,20 +9,17 @@ export async function runAudit(targetUrl: string) {
   const base = new URL(targetUrl);
   const baseDomain = base.hostname.split(".").slice(-2).join(".");
 
-  // --- tracking counters
+  // counters
   let totalBeacons = 0;
   let clientSideEvents = 0;
   let serverSideEvents = 0;
   const detectedServerDomains = new Set<string>();
 
-  // --- cookie storage
+  // cookie stores
   const allServerCookies: any[] = [];
   const browserCookies: any[] = [];
 
-  // --- detection patterns
-  const serverSideKeywords = ["track", "data", "events", "analytics", "measure", "collect", "t", "cookies", "pixel", "ss"];
-  const excludedPaths = ["/cdn/", "/shop/", "/assets/", "/theme", "observer.js", "bundle.js"];
-
+  // ad-platform patterns
   const PLATFORM_PATTERNS: Record<string, RegExp[]> = {
     Facebook: [/facebook\.com/, /fbp/, /fbc/],
     Google: [/google\.com/, /gcl_/, /_ga/, /_gid/],
@@ -33,19 +30,31 @@ export async function runAudit(targetUrl: string) {
     Other: [],
   };
 
-  // --- network listener
+  // strict subdomain allow-list for true first-party servers
+  const firstPartyPatterns = (process.env.FIRST_PARTY_PATTERNS ||
+    "data,track,events,analytics,measure")
+    .split(",")
+    .map((s) => s.trim().toLowerCase());
+
+  const firstPartyRegex = new RegExp(
+    `^(${firstPartyPatterns.join("|")})\\.${baseDomain.replace(".", "\\.")}$`
+  );
+
+  // listen for network responses
   page.on("response", async (resp) => {
     try {
       const url = new URL(resp.url());
       const headers = await resp.allHeaders();
+      const hostname = url.hostname.toLowerCase();
+      totalBeacons++;
 
-      // --- capture server-set cookies
+      // ---- capture server-set cookies ----
       if (headers["set-cookie"]) {
         const cookieList = headers["set-cookie"].split(",");
         cookieList.forEach((c) => {
-          const cookieDomain = url.hostname.toLowerCase();
+          const cookieDomain = hostname;
           const isFirstParty = cookieDomain.endsWith(baseDomain);
-          const fromServerSubdomain = /^(data|track|events|analytics)\./.test(cookieDomain);
+          const fromServerSubdomain = firstPartyRegex.test(cookieDomain);
           allServerCookies.push({
             cookie: c.split(";")[0].trim(),
             domain: cookieDomain,
@@ -56,45 +65,39 @@ export async function runAudit(targetUrl: string) {
         });
       }
 
-      // --- classify requests
-      const hostname = url.hostname.toLowerCase();
-      const pathname = url.pathname.toLowerCase();
-      totalBeacons++;
+      // ---- classify request ----
+      const isBrandOwnedSubdomain = firstPartyRegex.test(hostname);
+      const isClearlyThirdParty =
+        !hostname.endsWith(baseDomain) || hostname === baseDomain;
 
-      const isFirstPartyServer =
-        serverSideKeywords.some(
-          (k) => hostname.startsWith(k + ".") || pathname.includes("/" + k)
-        ) &&
-        !excludedPaths.some((x) => pathname.includes(x) || hostname.includes("cdn"));
-
-      if (isFirstPartyServer) {
+      if (isBrandOwnedSubdomain) {
         serverSideEvents++;
         detectedServerDomains.add(resp.url());
-      } else if (hostname.endsWith(baseDomain)) {
+      } else {
         clientSideEvents++;
       }
     } catch {
-      /* ignore parsing issues */
+      /* ignore */
     }
   });
 
-  // --- load page
+  // ---- load the page ----
   const start = Date.now();
   await page.goto(targetUrl, { waitUntil: "networkidle", timeout: 60000 });
   const loadTimeMS = Date.now() - start;
 
-  // --- collect cookies visible to browser
+  // ---- collect browser cookies ----
   const cookies = await context.cookies();
   cookies.forEach((c) => browserCookies.push(c));
 
-  // --- correlate with server-set cookies
+  // ---- correlate cookies with server-set cookies ----
   browserCookies.forEach((c) => {
     const match = allServerCookies.find((s) => c.name === s.cookie.split("=")[0]);
     c.setByServer = match ? match.domain : null;
     c.isFirstPartyServerCookie = match ? match.fromServerSubdomain : false;
   });
 
-  // --- detect ad / analytics platform for each cookie
+  // ---- detect ad / analytics platform ----
   function detectPlatform(cookieName: string, cookieDomain: string): string {
     for (const [platform, patterns] of Object.entries(PLATFORM_PATTERNS)) {
       if (patterns.some((re) => re.test(cookieName) || re.test(cookieDomain))) return platform;
@@ -102,40 +105,38 @@ export async function runAudit(targetUrl: string) {
     return "Other";
   }
 
-  browserCookies.forEach((c) => {
-    c.platform = detectPlatform(c.name, c.domain);
-  });
+  browserCookies.forEach((c) => (c.platform = detectPlatform(c.name, c.domain)));
 
-  // --- cookie metrics
-  const firstPartyCookies = browserCookies.filter((c) => c.domain.includes(baseDomain));
-  const thirdPartyCookies = browserCookies.filter((c) => !c.domain.includes(baseDomain));
+  // ---- cookie metrics ----
+  const firstPartyCookies = browserCookies.filter((c) => c.domain.endsWith(baseDomain));
+  const thirdPartyCookies = browserCookies.filter((c) => !c.domain.endsWith(baseDomain));
   const insecureCookies = browserCookies.filter(
     (c) => c.sameSite === "None" || !c.secure
   );
   const serverSetCookies = browserCookies.filter((c) => c.setByServer);
   const firstPartyServerCookies = browserCookies.filter((c) => c.isFirstPartyServerCookie);
 
-  // --- cookies by platform
+  // ---- cookies by platform ----
   const cookiesByPlatform: Record<string, { firstParty: number; thirdParty: number }> = {};
   browserCookies.forEach((c) => {
     const platform = c.platform || "Other";
-    const isFirst = c.domain.includes(baseDomain);
-    if (!cookiesByPlatform[platform]) cookiesByPlatform[platform] = { firstParty: 0, thirdParty: 0 };
+    const isFirst = c.domain.endsWith(baseDomain);
+    if (!cookiesByPlatform[platform])
+      cookiesByPlatform[platform] = { firstParty: 0, thirdParty: 0 };
     if (isFirst) cookiesByPlatform[platform].firstParty++;
     else cookiesByPlatform[platform].thirdParty++;
   });
 
-  // --- scoring
+  // ---- scoring ----
   const cookieHealthScore =
     (firstPartyServerCookies.length / (browserCookies.length || 1)) * 100;
-
   const scores = {
     technical: Math.min(100, 50 + cookieHealthScore / 2),
     firstPartyBias: Math.min(100, 70 + firstPartyServerCookies.length),
     potentialWithFirstParty: 95,
   };
 
-  // --- output JSON
+  // ---- output JSON ----
   const result = {
     summary: {
       url: targetUrl,
@@ -147,7 +148,11 @@ export async function runAudit(targetUrl: string) {
       transferSizeKB: Math.round((await page.content()).length / 1024),
     },
     tracking: {
-      beaconBreakdown: { client: clientSideEvents, server: serverSideEvents, total: totalBeacons },
+      beaconBreakdown: {
+        client: clientSideEvents,
+        server: serverSideEvents,
+        total: totalBeacons,
+      },
       serverDomainsDetected: Array.from(detectedServerDomains),
     },
     cookies: {

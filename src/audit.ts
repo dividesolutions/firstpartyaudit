@@ -30,7 +30,7 @@ export async function runAudit(targetUrl: string) {
     Other: [],
   };
 
-  // --- True first-party server subdomain patterns
+  // --- True first-party server subdomain patterns (you already included ss, etc.)
   const firstPartyPatterns = (process.env.FIRST_PARTY_PATTERNS ||
     "data,track,events,analytics,measure,stats,metrics,collect,collector,t,ss,sgtm,tagging,gtm")
     .split(",")
@@ -79,17 +79,15 @@ export async function runAudit(targetUrl: string) {
     }
   });
 
-// --- Load the page with safer timing ---
-const start = Date.now();
-try {
-  await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
-  // Attempt to wait for quieter network for up to 15s, ignore timeout
-  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
-} catch (err) {
-  console.warn(`⚠️ Navigation warning for ${targetUrl}:`, (err as Error).message);
-}
-const loadTimeMS = Date.now() - start;
-
+  // --- Load the page with safer timing ---
+  const start = Date.now();
+  try {
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
+    await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+  } catch (err) {
+    console.warn(`⚠️ Navigation warning for ${targetUrl}:`, (err as Error).message);
+  }
+  const loadTimeMS = Date.now() - start;
 
   // --- Collect cookies visible to the browser
   const cookies = await context.cookies();
@@ -111,17 +109,38 @@ const loadTimeMS = Date.now() - start;
   }
   browserCookies.forEach((c) => (c.platform = detectPlatform(c.name, c.domain)));
 
+  // --- Cookie metrics setup
+  const serverDomainsList = Array.from(detectedServerDomains).map((u) =>
+    new URL(u).hostname.toLowerCase()
+  );
+
+  // Upgrade platform cookies if a first-party tracking subdomain was observed
+  if (serverDomainsList.some((d) => trueFirstPartyRegex.test(d))) {
+    browserCookies.forEach((c) => {
+      if (
+        /(_fbp|_fbc|_ga|_gid|_gcl_au|_ttcid|_ttp)/.test(c.name) &&
+        c.domain.endsWith(baseDomain)
+      ) {
+        c.isFirstPartyServerCookie = true;
+      }
+    });
+  }
+
   // ---- Cookie metrics (redefined)
   const firstPartyServerCookies = browserCookies.filter(
     (c) => c.isFirstPartyServerCookie && trueFirstPartyRegex.test(c.domain)
   );
 
-  const firstPartyCookies = browserCookies.filter((c) =>
-    trueFirstPartyRegex.test(c.domain)
+  const firstPartyCookies = browserCookies.filter(
+    (c) =>
+      trueFirstPartyRegex.test(c.domain) ||
+      serverDomainsList.some((h) => c.domain.includes(h.split(".")[0]))
   );
 
   const thirdPartyCookies = browserCookies.filter(
-    (c) => !trueFirstPartyRegex.test(c.domain)
+    (c) =>
+      !trueFirstPartyRegex.test(c.domain) &&
+      !serverDomainsList.some((h) => c.domain.includes(h.split(".")[0]))
   );
 
   const insecureCookies = browserCookies.filter(
@@ -133,7 +152,9 @@ const loadTimeMS = Date.now() - start;
   const cookiesByPlatform: Record<string, { firstParty: number; thirdParty: number }> = {};
   browserCookies.forEach((c) => {
     const platform = c.platform || "Other";
-    const isTrueFirstParty = trueFirstPartyRegex.test(c.domain);
+    const isTrueFirstParty =
+      trueFirstPartyRegex.test(c.domain) ||
+      serverDomainsList.some((h) => c.domain.includes(h.split(".")[0]));
     if (!cookiesByPlatform[platform])
       cookiesByPlatform[platform] = { firstParty: 0, thirdParty: 0 };
     if (isTrueFirstParty) cookiesByPlatform[platform].firstParty++;

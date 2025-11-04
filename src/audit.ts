@@ -32,7 +32,7 @@ export async function runAudit(targetUrl: string) {
 
   // --- True first-party server subdomain patterns
   const firstPartyPatterns = (process.env.FIRST_PARTY_PATTERNS ||
-    "data,track,events,analytics,measure")
+    "data,track,events,analytics,measure,stats,metrics,collect,collector,t,ss,sgtm,tagging,gtm")
     .split(",")
     .map((s) => s.trim().toLowerCase());
 

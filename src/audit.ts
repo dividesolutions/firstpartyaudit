@@ -2,7 +2,10 @@
 import { chromium } from "playwright";
 
 export async function runAudit(targetUrl: string) {
-  const browser = await chromium.launch({ headless: true, args: ["--no-sandbox"] });
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox"],
+  });
   const context = await browser.newContext();
   const page = await context.newPage();
 
@@ -31,8 +34,10 @@ export async function runAudit(targetUrl: string) {
   };
 
   // --- True first-party server subdomain patterns (already includes ss, etc.)
-  const firstPartyPatterns = (process.env.FIRST_PARTY_PATTERNS ||
-    "data,track,events,analytics,measure,stats,metrics,collect,collector,t,ss,sgtm,tagging,gtm")
+  const firstPartyPatterns = (
+    process.env.FIRST_PARTY_PATTERNS ||
+    "data,track,events,analytics,measure,stats,metrics,collect,collector,t,ss,sgtm,tagging,gtm"
+  )
     .split(",")
     .map((s) => s.trim().toLowerCase());
 
@@ -57,7 +62,9 @@ export async function runAudit(targetUrl: string) {
         rawCookies.forEach((c) => {
           const parts = c.split(";");
           const nameValue = parts.shift()?.trim() || "";
-          const domainAttr = parts.find((p) => p.trim().toLowerCase().startsWith("domain="));
+          const domainAttr = parts.find((p) =>
+            p.trim().toLowerCase().startsWith("domain=")
+          );
           const cookieDomain = domainAttr
             ? domainAttr.split("=")[1].trim().replace(/^\./, "").toLowerCase()
             : url.hostname.toLowerCase();
@@ -93,10 +100,18 @@ export async function runAudit(targetUrl: string) {
   // --- Load the page with safer timing ---
   const start = Date.now();
   try {
-    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
-    await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+    await page.goto(targetUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: 45000,
+    });
+    await page
+      .waitForLoadState("networkidle", { timeout: 15000 })
+      .catch(() => {});
   } catch (err) {
-    console.warn(`⚠️ Navigation warning for ${targetUrl}:`, (err as Error).message);
+    console.warn(
+      `⚠️ Navigation warning for ${targetUrl}:`,
+      (err as Error).message
+    );
   }
   const loadTimeMS = Date.now() - start;
 
@@ -121,11 +136,14 @@ export async function runAudit(targetUrl: string) {
   // --- Detect ad / analytics platform
   function detectPlatform(cookieName: string, cookieDomain: string): string {
     for (const [platform, patterns] of Object.entries(PLATFORM_PATTERNS)) {
-      if (patterns.some((re) => re.test(cookieName) || re.test(cookieDomain))) return platform;
+      if (patterns.some((re) => re.test(cookieName) || re.test(cookieDomain)))
+        return platform;
     }
     return "Other";
   }
-  browserCookies.forEach((c) => (c.platform = detectPlatform(c.name, c.domain)));
+  browserCookies.forEach(
+    (c) => (c.platform = detectPlatform(c.name, c.domain))
+  );
 
   // --- Cookie metrics setup
   const serverDomainsList = Array.from(detectedServerDomains).map((u) =>
@@ -167,7 +185,10 @@ export async function runAudit(targetUrl: string) {
   const serverSetCookies = browserCookies.filter((c) => c.setByServer);
 
   // ---- Cookies by platform (using new first-party logic)
-  const cookiesByPlatform: Record<string, { firstParty: number; thirdParty: number }> = {};
+  const cookiesByPlatform: Record<
+    string,
+    { firstParty: number; thirdParty: number }
+  > = {};
   browserCookies.forEach((c) => {
     const platform = c.platform || "Other";
     const isTrueFirstParty =

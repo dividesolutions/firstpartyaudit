@@ -282,8 +282,8 @@ type HostStats = {
   requests: number;
   posts: number;
 
-  setCookieResponses: number; // number of responses that included Set-Cookie
-  setCookieCount: number; // total cookie items set via Set-Cookie
+  setCookieResponses: number;
+  setCookieCount: number;
   cookieNames: Record<string, number>;
 
   identifierKeys: Record<string, number>;
@@ -368,11 +368,10 @@ function safePath(u: URL): string {
 
 /**
  * Split Set-Cookie safely:
- * - Set-Cookie header can appear as multiple headers or one combined string depending on runtime.
- * - This keeps it “good enough” for common cases.
+ * - Sometimes comes as one combined string (comma-delimited)
+ * - Sometimes comes as multiple headers/values
  */
 function splitSetCookie(raw: string): string[] {
-  // Split on comma only when it looks like a new cookie starts (name=...)
   return raw
     .split(/,(?=[^ ;]+=)/)
     .map((s) => s.trim())
@@ -475,6 +474,39 @@ function scanForIdentifiers(opts: {
   return [...uniq.values()];
 }
 
+// ---- Behavior-based tracking heuristics (no fixed subdomain list required)
+const COLLECTOR_PATH_HINTS = [
+  "/collect",
+  "/g/collect",
+  "/ccm/collect",
+  "/events",
+  "/event",
+  "/track",
+  "/tracking",
+  "/pixel",
+  "/pixels",
+  "/ingest",
+  "/beacon",
+  "/monorail",
+  "/web-pixels",
+  "/sdk/",
+  "/v1/events",
+  "/v2/events",
+  "/api/events",
+  "/api/collect",
+];
+
+function hostLooksLikeTracking(stat: HostStats): boolean {
+  if (stat.posts > 0) return true;
+  if (stat.setCookieCount > 0) return true;
+  if (stat.identifierHits > 0) return true;
+
+  const paths = Object.keys(stat.topPaths || {});
+  return paths.some((p) =>
+    COLLECTOR_PATH_HINTS.some((hint) => p.toLowerCase().includes(hint))
+  );
+}
+
 export async function runAudit(targetUrl: string) {
   const browser: Browser = await chromium.launch({
     headless: true,
@@ -485,30 +517,18 @@ export async function runAudit(targetUrl: string) {
     const context = await browser.newContext();
     const page = await context.newPage();
 
-    const base = new URL(targetUrl);
+    const baseDomain = getRegistrableDomain(targetUrl);
 
-    // ✅ Better than split(".").slice(-2) (handles .co.uk etc.)
-    const registrableDomain = getRegistrableDomain(targetUrl);
-
-    // Keep your original style variable name for compatibility if you want:
-    const baseDomain = registrableDomain;
-
-    // Counters
-    let totalBeacons = 0;
-    let clientSideEvents = 0;
-    let serverSideEvents = 0;
-    const detectedServerDomains = new Set<string>(); // URLs (your existing behavior)
-
-    // Storage
-    const allServerCookies: any[] = [];
-    const browserCookies: any[] = [];
-
-    // --- NEW: endpoint mapping storage
+    // ---- Request/endpoint mapping storage
     const requestRecords: RequestRecord[] = [];
     const hosts = new Map<string, HostStats>();
     const reqToIndex = new Map<Request, number>();
 
-    // --- Platform patterns
+    // ---- Your cookie storage
+    const allServerCookies: any[] = [];
+    const browserCookies: any[] = [];
+
+    // ---- Platform patterns (cookie-based)
     const PLATFORM_PATTERNS: Record<string, RegExp[]> = {
       Facebook: [/facebook\.com/, /fbp/, /fbc/],
       Google: [/google\.com/, /gcl_/, /_ga/, /_gid/],
@@ -519,26 +539,7 @@ export async function runAudit(targetUrl: string) {
       Other: [],
     };
 
-    // --- True first-party server subdomain patterns (already includes ss, etc.)
-    const firstPartyPatterns = (
-      process.env.FIRST_PARTY_PATTERNS ||
-      "data,track,events,analytics,measure,stats,metrics,collect,collector,t,ss,sgtm,tagging,gtm"
-    )
-      .split(",")
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean);
-
-    // Match EXACTLY "<pattern>.<registrableDomain>"
-    // Examples: "ss.example.com", "track.example.com"
-    const trueFirstPartyRegex = new RegExp(
-      `^(${firstPartyPatterns.join("|")})\\.${baseDomain.replace(
-        /\./g,
-        "\\."
-      )}$`,
-      "i"
-    );
-
-    // --- NEW: request listener (captures method, URL, POST size, identifier hits, etc.)
+    // ---- Request listener: collect URLs, methods, identifiers, and host stats
     page.on("request", (req) => {
       try {
         const url = new URL(req.url());
@@ -573,7 +574,6 @@ export async function runAudit(targetUrl: string) {
         const idx = requestRecords.push(record) - 1;
         reqToIndex.set(req, idx);
 
-        // Aggregate
         const stat = getOrInitHostStats(hosts, hostname, group);
         stat.requests += 1;
         if (method === "POST") stat.posts += 1;
@@ -588,27 +588,25 @@ export async function runAudit(targetUrl: string) {
       }
     });
 
-    // --- Your existing response listener, upgraded to enrich endpoint mapping
+    // ---- Response listener: capture status and server-set cookies
     page.on("response", async (resp: Response) => {
       try {
         const url = new URL(resp.url());
         const hostname = normalizeHostname(url.hostname);
+        const group = classifyHost(hostname, baseDomain);
+
         const headers = await resp.allHeaders();
-
-        totalBeacons++;
-
-        // ----- NEW: enrich the matching request record (status, Set-Cookie, etc.)
         const req = resp.request();
+
+        // enrich request record
         const idx = reqToIndex.get(req);
         const record = idx !== undefined ? requestRecords[idx] : undefined;
-
         if (record) {
           record.status = resp.status();
           record.ok = resp.ok();
         }
 
-        // Capture server-set cookies (including Domain= attr from Set-Cookie)
-        // NOTE: allHeaders() usually lowercases keys, but we’ll check both.
+        // Set-Cookie
         const setCookieHeader =
           (headers as any)["set-cookie"] ?? (headers as any)["Set-Cookie"];
 
@@ -627,32 +625,27 @@ export async function runAudit(targetUrl: string) {
               line,
               hostname
             );
-            const fromServerSubdomain = trueFirstPartyRegex.test(hostname);
 
             allServerCookies.push({
               cookie: (line.split(";")[0] ?? "").trim(), // "name=value"
               domain: cookieDomain,
-              fromServerSubdomain,
               setBy: hostname,
               source: "server-set",
             });
           });
 
-          // ----- NEW: update per-host stats + request record
-          const stat = getOrInitHostStats(
-            hosts,
-            hostname,
-            classifyHost(hostname, baseDomain)
-          );
+          // update host stats
+          const stat = getOrInitHostStats(hosts, hostname, group);
           stat.setCookieResponses += 1;
           stat.setCookieCount += cookieNamesForThisResponse.length;
           for (const n of cookieNamesForThisResponse) bump(stat.cookieNames, n);
 
+          // update request record
           if (record) {
             record.setCookieNames = cookieNamesForThisResponse;
             record.setCookieCount = cookieNamesForThisResponse.length;
 
-            // If Set-Cookie introduced identifier-ish cookie names, capture that too
+            // identifier scan using cookie names too
             const extraHits = scanForIdentifiers({
               url: new URL(record.url),
               method: record.method,
@@ -667,8 +660,7 @@ export async function runAudit(targetUrl: string) {
             for (const h of extraHits) merged.set(`${h.key}:${h.where}`, h);
             record.identifierHits = [...merged.values()];
 
-            // Also bump per-host identifier counts for any *new* hits
-            // (Cheap delta: bump everything from record; MVP is fine)
+            // rebuild per-host identifier counts (MVP safe)
             stat.identifierHits = 0;
             stat.identifierKeys = {};
             for (const r of requestRecords) {
@@ -680,33 +672,12 @@ export async function runAudit(targetUrl: string) {
             }
           }
         }
-
-        // ----- Your existing classification logic (fixed)
-        const isBrandOwnedSubdomain = trueFirstPartyRegex.test(hostname);
-
-        // This was inverted in your code:
-        // you had: !hostname.endsWith(baseDomain) || hostname === baseDomain
-        // which marks the root domain as "third party". Not what you want.
-        const isFirstPartyDomain =
-          hostname === baseDomain || hostname.endsWith("." + baseDomain);
-
-        if (isBrandOwnedSubdomain) {
-          serverSideEvents++;
-          detectedServerDomains.add(resp.url()); // keep existing behavior (URL list)
-        } else {
-          // If you want "clientSideEvents" to mean "everything else", keep as-is.
-          // If you want it to mean "third-party only", change to: if (!isFirstPartyDomain) clientSideEvents++;
-          clientSideEvents++;
-        }
-
-        // If you ever want to track actual 3rd party beacons separately:
-        // if (!isFirstPartyDomain) thirdPartyEvents++;
       } catch {
         /* ignore */
       }
     });
 
-    // --- Load the page with safer timing ---
+    // ---- Load page
     const start = Date.now();
     try {
       await page.goto(targetUrl, {
@@ -724,11 +695,20 @@ export async function runAudit(targetUrl: string) {
     }
     const loadTimeMS = Date.now() - start;
 
-    // --- Collect cookies visible to the browser
+    // ---- Light interaction to trigger more tags (optional but helpful)
+    try {
+      await page.waitForTimeout(2000);
+      await page.mouse.wheel(0, 1200);
+      await page.waitForTimeout(2000);
+    } catch {
+      /* ignore */
+    }
+
+    // ---- Collect browser cookies
     const cookies = await context.cookies();
     cookies.forEach((c) => browserCookies.push(c));
 
-    // --- Correlate cookies with server-set cookies
+    // ---- Correlate browser cookies to server-set cookies
     browserCookies.forEach((c) => {
       const match = allServerCookies.find(
         (s) =>
@@ -737,12 +717,10 @@ export async function runAudit(targetUrl: string) {
       );
       if (match) {
         c.setByServer = match.setBy;
-        c.isFirstPartyServerCookie =
-          match.fromServerSubdomain || trueFirstPartyRegex.test(match.setBy);
       }
     });
 
-    // --- Detect ad / analytics platform
+    // ---- Platform classification (cookie name/domain)
     function detectPlatform(cookieName: string, cookieDomain: string): string {
       for (const [platform, patterns] of Object.entries(PLATFORM_PATTERNS)) {
         if (patterns.some((re) => re.test(cookieName) || re.test(cookieDomain)))
@@ -754,72 +732,7 @@ export async function runAudit(targetUrl: string) {
       (c) => (c.platform = detectPlatform(c.name, c.domain))
     );
 
-    // --- Cookie metrics setup
-    const serverDomainsList = Array.from(detectedServerDomains).map((u) =>
-      new URL(u).hostname.toLowerCase()
-    );
-
-    // Upgrade platform cookies if a first-party tracking subdomain was observed
-    if (serverDomainsList.some((d) => trueFirstPartyRegex.test(d))) {
-      browserCookies.forEach((c) => {
-        if (
-          /(_fbp|_fbc|_ga|_gid|_gcl_au|_ttcid|_ttp)/.test(c.name) &&
-          c.domain.endsWith(baseDomain)
-        ) {
-          c.isFirstPartyServerCookie = true;
-        }
-      });
-    }
-
-    // ---- Cookie metrics (redefined)
-    const firstPartyServerCookies = browserCookies.filter(
-      (c) => c.isFirstPartyServerCookie && c.domain.endsWith(baseDomain)
-    );
-
-    const firstPartyCookies = browserCookies.filter(
-      (c) =>
-        trueFirstPartyRegex.test(c.domain) ||
-        serverDomainsList.some((h) => c.domain.includes(h.split(".")[0]))
-    );
-
-    const thirdPartyCookies = browserCookies.filter(
-      (c) =>
-        !trueFirstPartyRegex.test(c.domain) &&
-        !serverDomainsList.some((h) => c.domain.includes(h.split(".")[0]))
-    );
-
-    const insecureCookies = browserCookies.filter(
-      (c) => c.sameSite === "None" || !c.secure
-    );
-    const serverSetCookies = browserCookies.filter((c) => c.setByServer);
-
-    // ---- Cookies by platform (using new first-party logic)
-    const cookiesByPlatform: Record<
-      string,
-      { firstParty: number; thirdParty: number }
-    > = {};
-    browserCookies.forEach((c) => {
-      const platform = c.platform || "Other";
-      const isTrueFirstParty =
-        c.isFirstPartyServerCookie ||
-        trueFirstPartyRegex.test(c.domain) ||
-        serverDomainsList.some((h) => c.domain.includes(h.split(".")[0]));
-      if (!cookiesByPlatform[platform])
-        cookiesByPlatform[platform] = { firstParty: 0, thirdParty: 0 };
-      if (isTrueFirstParty) cookiesByPlatform[platform].firstParty++;
-      else cookiesByPlatform[platform].thirdParty++;
-    });
-
-    // ---- Scoring
-    const cookieHealthScore =
-      (firstPartyServerCookies.length / (browserCookies.length || 1)) * 100;
-    const scores = {
-      technical: Math.min(100, 50 + cookieHealthScore / 2),
-      firstPartyBias: Math.min(100, 70 + firstPartyServerCookies.length),
-      potentialWithFirstParty: 95,
-    };
-
-    // ---- NEW: build endpoint grouping output
+    // ---- Build endpoint grouping
     const endpoints = {
       root: {} as Record<string, HostStats>,
       subdomains: {} as Record<string, HostStats>,
@@ -833,13 +746,94 @@ export async function runAudit(targetUrl: string) {
       else endpoints.thirdParty[stat.hostname] = stat;
     }
 
-    // ---- JSON output (your existing shape + endpoints)
+    // ---- Behavior-based “server-side tracking” detection
+    const trackingFirstPartySubdomains = Object.values(
+      endpoints.subdomains
+    ).filter((s) => hostLooksLikeTracking(s));
+
+    const trackingRoot = Object.values(endpoints.root).filter((s) =>
+      hostLooksLikeTracking(s)
+    );
+
+    const trackingHosts = new Set<string>([
+      ...trackingFirstPartySubdomains.map((h) => h.hostname),
+      ...trackingRoot.map((h) => h.hostname),
+    ]);
+
+    // ---- Beacon breakdown based on behavior (not name patterns)
+    let computedServer = 0;
+    let computedClient = 0;
+    let computedThirdParty = 0;
+
+    for (const r of requestRecords) {
+      const isThirdParty = r.group === "thirdParty";
+      if (isThirdParty) computedThirdParty++;
+
+      if (trackingHosts.has(r.hostname)) computedServer++;
+      else computedClient++;
+    }
+
+    // ---- Cookie metrics (simplified + aligned with endpoint evidence)
+    // “First-party server cookies” = cookies that were set by a first-party host (root or subdomain)
+    const firstPartyHostnames = new Set<string>([
+      ...Object.keys(endpoints.root),
+      ...Object.keys(endpoints.subdomains),
+    ]);
+
+    const firstPartyServerCookies = browserCookies.filter(
+      (c) =>
+        c.setByServer &&
+        firstPartyHostnames.has(normalizeHostname(c.setByServer))
+    );
+
+    // “First-party cookies” = cookie domain ends with baseDomain
+    const firstPartyCookies = browserCookies.filter((c) =>
+      normalizeHostname(c.domain).endsWith(baseDomain)
+    );
+
+    const thirdPartyCookies = browserCookies.filter(
+      (c) => !normalizeHostname(c.domain).endsWith(baseDomain)
+    );
+
+    const insecureCookies = browserCookies.filter(
+      (c) => c.sameSite === "None" || !c.secure
+    );
+
+    const serverSetCookies = browserCookies.filter((c) => c.setByServer);
+
+    // ---- Cookies by platform (first-party vs third-party by cookie domain)
+    const cookiesByPlatform: Record<
+      string,
+      { firstParty: number; thirdParty: number }
+    > = {};
+    browserCookies.forEach((c) => {
+      const platform = c.platform || "Other";
+      const isFirstParty = normalizeHostname(c.domain).endsWith(baseDomain);
+      if (!cookiesByPlatform[platform])
+        cookiesByPlatform[platform] = { firstParty: 0, thirdParty: 0 };
+      if (isFirstParty) cookiesByPlatform[platform].firstParty++;
+      else cookiesByPlatform[platform].thirdParty++;
+    });
+
+    // ---- Scoring (keep your approach)
+    const cookieHealthScore =
+      (firstPartyServerCookies.length / (browserCookies.length || 1)) * 100;
+
+    const scores = {
+      technical: Math.min(100, 50 + cookieHealthScore / 2),
+      firstPartyBias: Math.min(100, 70 + firstPartyServerCookies.length),
+      potentialWithFirstParty: 95,
+    };
+
+    const hasFirstPartyServerTracking = trackingHosts.size > 0;
+
+    // ---- Output
     const result = {
       summary: {
         url: targetUrl,
-        title: await page.title(),
+        title: await page.title().catch(() => ""),
         timestamp: new Date().toISOString(),
-        baseDomain, // helpful for UI/debug
+        baseDomain,
       },
       performance: {
         loadTimeMS,
@@ -847,11 +841,14 @@ export async function runAudit(targetUrl: string) {
       },
       tracking: {
         beaconBreakdown: {
-          client: clientSideEvents,
-          server: serverSideEvents,
-          total: totalBeacons,
+          // client/server based on behavior evidence
+          client: computedClient,
+          server: computedServer,
+          thirdParty: computedThirdParty,
+          total: requestRecords.length,
         },
-        serverDomainsDetected: Array.from(detectedServerDomains),
+        // Only “server domains detected” = first-party tracking-like endpoints
+        serverDomainsDetected: Array.from(trackingHosts),
       },
       cookies: {
         total: browserCookies.length,
@@ -862,14 +859,12 @@ export async function runAudit(targetUrl: string) {
         firstPartyServerSet: firstPartyServerCookies.length,
         byPlatform: cookiesByPlatform,
       },
-      // ✅ NEW: "defensible endpoint map"
-      endpoints, // root/subdomains/thirdParty with POST, set-cookie, identifier stats
+      endpoints,
       scores,
       insights: {
-        diagnosis:
-          serverSideEvents > 0
-            ? "Server-side tracking detected"
-            : "Client-side only tracking",
+        diagnosis: hasFirstPartyServerTracking
+          ? "Server-side tracking detected"
+          : "Client-side only tracking",
         opportunity:
           firstPartyServerCookies.length > 0
             ? "Strong foundation; minor improvements possible"

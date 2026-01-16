@@ -8,8 +8,20 @@ const { Pool } = pg;
 
 const app = Fastify({ logger: true });
 
-app.register(cors, {
-  origin: true,
+await app.register(cors, {
+  origin: (origin, cb) => {
+    const allowed = ["http://localhost:5173"];
+
+    // allow non-browser tools (curl, server-to-server)
+    if (!origin) return cb(null, true);
+
+    if (allowed.includes(origin)) {
+      cb(null, true);
+    } else {
+      cb(new Error("Not allowed by CORS"), false);
+    }
+  },
+  credentials: true,
 });
 
 const DATABASE_URL = process.env.DATABASE_URL;

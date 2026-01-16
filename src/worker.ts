@@ -8,6 +8,7 @@ const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) throw new Error("Missing DATABASE_URL env var");
 
 const POLL_MS = Number(process.env.WORKER_POLL_MS || 2000);
+const AUDIT_TIMEOUT_MS = Number(process.env.AUDIT_TIMEOUT_MS || 120000); // 2 min default
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -19,8 +20,22 @@ type AuditRow = {
   url: string;
 };
 
-async function sleep(ms: number) {
-  return new Promise((res) => setTimeout(res, ms));
+const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
+
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(
+      () => reject(new Error(`Audit timed out after ${ms}ms`)),
+      ms
+    );
+    p.then((v) => {
+      clearTimeout(t);
+      resolve(v);
+    }).catch((e) => {
+      clearTimeout(t);
+      reject(e);
+    });
+  });
 }
 
 /**
@@ -103,10 +118,14 @@ async function markFailed(id: string, message: string) {
 }
 
 async function main() {
-  console.log(`Worker started. Polling every ${POLL_MS}ms`);
+  await requeueStaleRunning();
+  console.log(
+    `Worker started. Polling every ${POLL_MS}ms. Timeout ${AUDIT_TIMEOUT_MS}ms`
+  );
 
   while (true) {
     let job: AuditRow | null = null;
+
     try {
       job = await claimNextQueued();
 
@@ -123,18 +142,53 @@ async function main() {
         [job.id]
       );
 
-      const report = await runAudit(job.url);
+      const report = await withTimeout(runAudit(job.url), AUDIT_TIMEOUT_MS);
 
       console.log(`Finished audit ${job.id}`);
       await markFinished(job.id, report);
     } catch (err: any) {
       console.error("Worker loop error:", err?.message || err);
+
       if (job) {
         await markFailed(job.id, err?.message || "Unknown audit error");
       }
+
+      // Prevent tight loop on repeated errors (DB down, etc.)
+      await sleep(POLL_MS);
     }
   }
 }
+
+async function requeueStaleRunning() {
+  const minutes = Number(process.env.STALE_MINUTES || 15);
+  const res = await pool.query(
+    `
+    UPDATE audits
+    SET status = 'queued',
+        progress = 0,
+        updated_at = NOW(),
+        error = 'Re-queued (stale running job)'
+    WHERE status = 'running'
+      AND started_at < NOW() - ($1 || ' minutes')::interval
+    `,
+    [minutes]
+  );
+
+  if (res.rowCount) {
+    console.log(`Re-queued ${res.rowCount} stale running job(s)`);
+  }
+}
+
+process.on("SIGTERM", async () => {
+  console.log("SIGTERM received, shutting down...");
+  await pool.end();
+  process.exit(0);
+});
+process.on("SIGINT", async () => {
+  console.log("SIGINT received, shutting down...");
+  await pool.end();
+  process.exit(0);
+});
 
 main().catch((e) => {
   console.error("Fatal worker error:", e);

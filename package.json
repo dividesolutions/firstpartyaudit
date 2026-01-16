@@ -6,7 +6,8 @@
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
     "worker": "tsx src/worker.ts",
-    "build": "tsc"
+    "build": "tsc",
+    "start:worker": "node dist/worker.js"
   },
   "dependencies": {
     "dotenv": "^17.2.3",
@@ -19,6 +20,7 @@
     "@types/node": "^20.19.27",
     "@types/pg": "^8.16.0",
     "ts-node": "^10.9.2",
+    "ts-node-dev": "^2.0.0",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3"
   }

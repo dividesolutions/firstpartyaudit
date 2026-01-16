@@ -2,10 +2,15 @@ import Fastify from "fastify";
 import { z } from "zod";
 import pg from "pg";
 import "dotenv/config";
+import cors from "@fastify/cors";
 
 const { Pool } = pg;
 
 const app = Fastify({ logger: true });
+
+app.register(cors, {
+  origin: true,
+});
 
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) throw new Error("Missing DATABASE_URL env var");

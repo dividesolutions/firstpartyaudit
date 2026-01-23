@@ -51,6 +51,47 @@ type RequestRecord = {
   identifierHits?: IdentifierHit[];
 };
 
+type CookieParty = "firstParty" | "thirdParty";
+type SetterGroup = "root" | "subdomain" | "thirdParty" | "unknown";
+
+type PlatformCookieStats = {
+  total: number;
+
+  // Scope (cookie.domain based)
+  scope: {
+    firstParty: number;
+    thirdParty: number;
+  };
+
+  // How it was set (best effort)
+  setMethod: {
+    server: number; // correlated via Set-Cookie
+    client: number; // no server correlation found
+  };
+
+  // Who set it (only meaningful when server-set)
+  serverSetterGroup: Record<SetterGroup, number>;
+
+  // Your key signals
+  firstPartyServerSet: number; // server-set by root/subdomain
+  firstPartyTrackingSubdomainServerSet: number; // server-set by tracking subdomain only
+
+  insecure: number;
+
+  // Debug context (kept small)
+  uniqueCookieNames: number;
+  topCookieNames: Array<{ name: string; count: number }>;
+  domains: {
+    firstParty: string[];
+    thirdParty: string[];
+  };
+  serverSetByHosts: {
+    root: string[];
+    subdomain: string[];
+    thirdParty: string[];
+  };
+};
+
 // Lowercases and strips www.
 function normalizeHostname(hostname: string): string {
   let h = (hostname || "").trim().toLowerCase();
@@ -140,6 +181,25 @@ function extractCookieDomainFromSetCookie(
     ? domainAttr.split("=")[1].trim().replace(/^\./, "")
     : fallbackHostname;
   return normalizeHostname(cookieDomain);
+}
+
+function isFirstPartyCookieDomain(cookieDomain: string, baseDomain: string) {
+  return normalizeHostname(cookieDomain).endsWith(baseDomain);
+}
+
+function uniqPush(arr: string[], value: string, limit = 8) {
+  const v = String(value || "").trim();
+  if (!v) return;
+  if (arr.includes(v)) return;
+  if (arr.length >= limit) return;
+  arr.push(v);
+}
+
+function topN(map: Record<string, number>, n = 6) {
+  return Object.entries(map)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, n)
+    .map(([name, count]) => ({ name, count }));
 }
 
 // List of common advertising/analytics identifiers
@@ -463,7 +523,7 @@ export async function runAudit(targetUrl: string) {
     cookies.forEach((c) => browserCookies.push(c));
 
     // ---- Correlate browser cookies to server-set cookies (STRONGER matching)
-    // NOTE: This correlation is what enables "setByServer" to be meaningful.
+    // This correlation is what enables "setByServer" to be meaningful.
     browserCookies.forEach((c) => {
       const match = allServerCookies.find((s) => {
         const serverName = s.cookie.split("=")[0];
@@ -522,7 +582,7 @@ export async function runAudit(targetUrl: string) {
       ...trackingRoot.map((h) => h.hostname),
     ]);
 
-    // ✅ NEW: first-party tracking subdomain hostnames ONLY
+    // ✅ first-party tracking subdomain hostnames ONLY
     const trackingFirstPartySubdomainHosts = new Set<string>(
       trackingFirstPartySubdomains.map((h) => normalizeHostname(h.hostname)),
     );
@@ -556,19 +616,18 @@ export async function runAudit(targetUrl: string) {
 
     const serverSetCookies = browserCookies.filter((c) => c.setByServer);
 
-    // ✅ NEW: the thing you asked for
+    // ✅ the thing you asked for
     // "First-party tracking subdomain cookies" =
-    // cookies that can be attributed to a *first-party tracking subdomain* via Set-Cookie correlation.
+    // cookies attributed to a *first-party tracking subdomain* via Set-Cookie correlation.
     const firstPartyTrackingSubdomainCookies = browserCookies.filter((c) => {
       const setBy = normalizeHostname(c.setByServer ?? "");
       if (!setBy) return false;
       if (!trackingFirstPartySubdomainHosts.has(setBy)) return false;
 
-      // keep them scoped to your site (optional but usually correct)
+      // keep them scoped to your site (usually correct)
       return normalizeHostname(c.domain).endsWith(baseDomain);
     });
 
-    // (Optional) if you still want the older metric around:
     // "First-party server cookies" = cookies set by any first-party host (root OR any subdomain)
     const firstPartyHostnames = new Set<string>([
       ...Object.keys(endpoints.root),
@@ -580,20 +639,122 @@ export async function runAudit(targetUrl: string) {
       return setBy.length > 0 && firstPartyHostnames.has(setBy);
     });
 
-    // ---- Cookies by platform (first-party vs third-party by cookie domain)
+    // ---- Cookies by platform (improved: scope + setter + security + tracking-subdomain signal)
+    const cookiesByPlatformDetailed: Record<string, PlatformCookieStats> = {};
+
+    // For server-set cookies, classify setter host into root/subdomain/thirdParty
+    function classifySetterGroup(
+      setByHost: string | undefined | null,
+    ): SetterGroup {
+      const h = normalizeHostname(setByHost ?? "");
+      if (!h) return "unknown";
+      return classifyHost(h, baseDomain);
+    }
+
+    function initPlatformStats(): PlatformCookieStats {
+      return {
+        total: 0,
+        scope: { firstParty: 0, thirdParty: 0 },
+        setMethod: { server: 0, client: 0 },
+        serverSetterGroup: {
+          root: 0,
+          subdomain: 0,
+          thirdParty: 0,
+          unknown: 0,
+        },
+        firstPartyServerSet: 0,
+        firstPartyTrackingSubdomainServerSet: 0,
+        insecure: 0,
+        uniqueCookieNames: 0,
+        topCookieNames: [],
+        domains: { firstParty: [], thirdParty: [] },
+        serverSetByHosts: { root: [], subdomain: [], thirdParty: [] },
+      };
+    }
+
+    // Private name count maps for topCookieNames per platform
+    const platformNameCounts: Record<string, Record<string, number>> = {};
+
+    for (const c of browserCookies) {
+      const platform = c.platform || "Other";
+      if (!cookiesByPlatformDetailed[platform]) {
+        cookiesByPlatformDetailed[platform] = initPlatformStats();
+        platformNameCounts[platform] = {};
+      }
+
+      const stats = cookiesByPlatformDetailed[platform];
+      stats.total += 1;
+
+      // Scope party (cookie.domain)
+      const scopeParty: CookieParty = isFirstPartyCookieDomain(
+        c.domain,
+        baseDomain,
+      )
+        ? "firstParty"
+        : "thirdParty";
+
+      stats.scope[scopeParty] += 1;
+      if (scopeParty === "firstParty")
+        uniqPush(stats.domains.firstParty, normalizeHostname(c.domain));
+      else uniqPush(stats.domains.thirdParty, normalizeHostname(c.domain));
+
+      // Insecure (your definition)
+      const insecure = c.sameSite === "None" || !c.secure;
+      if (insecure) stats.insecure += 1;
+
+      // Set method + setter host grouping
+      const isServer = Boolean(c.setByServer);
+      if (isServer) {
+        stats.setMethod.server += 1;
+
+        const setterGroup = classifySetterGroup(c.setByServer);
+        stats.serverSetterGroup[setterGroup] += 1;
+
+        // Save a few setter hosts for debugging
+        const sb = normalizeHostname(c.setByServer);
+        if (setterGroup === "root") uniqPush(stats.serverSetByHosts.root, sb);
+        else if (setterGroup === "subdomain")
+          uniqPush(stats.serverSetByHosts.subdomain, sb);
+        else if (setterGroup === "thirdParty")
+          uniqPush(stats.serverSetByHosts.thirdParty, sb);
+
+        // firstPartyServerSet: server-set by root/subdomain
+        if (setterGroup === "root" || setterGroup === "subdomain") {
+          stats.firstPartyServerSet += 1;
+        }
+
+        // firstPartyTrackingSubdomainServerSet: server-set by tracking subdomain only
+        if (trackingFirstPartySubdomainHosts.has(sb)) {
+          stats.firstPartyTrackingSubdomainServerSet += 1;
+        }
+      } else {
+        stats.setMethod.client += 1;
+      }
+
+      // Top cookie name counts
+      const nameKey = String(c.name ?? "");
+      platformNameCounts[platform][nameKey] =
+        (platformNameCounts[platform][nameKey] ?? 0) + 1;
+    }
+
+    // finalize unique + top names
+    for (const [platform, stats] of Object.entries(cookiesByPlatformDetailed)) {
+      const nameMap = platformNameCounts[platform] ?? {};
+      stats.uniqueCookieNames = Object.keys(nameMap).length;
+      stats.topCookieNames = topN(nameMap, 6);
+    }
+
+    // Keep the old compact shape too (backwards compatible)
     const cookiesByPlatform: Record<
       string,
       { firstParty: number; thirdParty: number }
     > = {};
-
-    browserCookies.forEach((c) => {
-      const platform = c.platform || "Other";
-      const isFirstParty = normalizeHostname(c.domain).endsWith(baseDomain);
-      if (!cookiesByPlatform[platform])
-        cookiesByPlatform[platform] = { firstParty: 0, thirdParty: 0 };
-      if (isFirstParty) cookiesByPlatform[platform].firstParty++;
-      else cookiesByPlatform[platform].thirdParty++;
-    });
+    for (const [platform, stats] of Object.entries(cookiesByPlatformDetailed)) {
+      cookiesByPlatform[platform] = {
+        firstParty: stats.scope.firstParty,
+        thirdParty: stats.scope.thirdParty,
+      };
+    }
 
     // ---- Scoring
     // If your intent is “first-party cookies should mean tracking-subdomain cookies only”,
@@ -679,7 +840,7 @@ export async function runAudit(targetUrl: string) {
           total: requestRecords.length,
         },
         // serverDomainsDetected: Array.from(trackingHosts),
-        // trackingFirstPartySubdomains: Array.from(trackingFirstPartySubdomainHosts),
+        // trackingFirstPartySubdomainHosts: Array.from(trackingFirstPartySubdomainHosts),
       },
       cookies: {
         total: browserCookies.length,
@@ -688,30 +849,30 @@ export async function runAudit(targetUrl: string) {
         insecure: insecureCookies.length,
         serverSet: serverSetCookies.length,
 
-        // keep this if you still want the broad “server-set by any first-party host”
+        // broad “server-set by any first-party host”
         firstPartyServerSet: firstPartyServerCookies.length,
 
-        // ✅ NEW: what you asked for
+        // ✅ the signal you care about
         firstPartyTrackingSubdomainServerSet:
           firstPartyTrackingSubdomainCookies.length,
 
+        // old compact summary (kept)
         byPlatform: cookiesByPlatform,
+
+        // ✅ NEW richer breakdown
+        byPlatformDetailed: cookiesByPlatformDetailed,
       },
       // endpoints,
       scores,
       scoreDrivers: {
         hasFirstPartyCookies: firstPartyCookies.length > 0,
-
-        // ✅ changed to reflect tracking-subdomain cookies, not just any server cookie
         hasTrackingSubdomainServerSetCookies:
           firstPartyTrackingSubdomainCookies.length > 0,
-
         hasServerSideRouting: hasFirstPartyServerTracking,
         insecureCookieRatio: insecureRatio,
-
-        // helpful debugging signals
         trackingFirstPartySubdomainHostsCount:
           trackingFirstPartySubdomainHosts.size,
+        cookieHealthScore,
       },
       insights: {
         diagnosis: hasFirstPartyServerTracking

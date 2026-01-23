@@ -7,6 +7,21 @@ import {
 } from "playwright";
 import { parse as parseTld } from "tldts";
 
+/**
+ * Goal:
+ * - Produce a Stape-like report:
+ *   - scores: overall, analytics, ads, cookieLifetime, pageSpeed
+ *   - cookie table: (cookie name, provider, category, dataSentTo, lifetimeDays)
+ *   - trackers detected: platform, category, dataSentTo, trackingMethod, status
+ *
+ * Notes:
+ * - This is still a best-effort scanner (no consent click-through, no ad-click simulation by default).
+ * - If you want closer parity, run a second navigation with synthetic click IDs (see RUN_ATTRIBUTION_SIMULATION).
+ */
+
+// -----------------------------
+// Types
+// -----------------------------
 type HostGroup = "root" | "subdomain" | "thirdParty";
 
 type IdentifierHit = {
@@ -17,7 +32,6 @@ type IdentifierHit = {
 type HostStats = {
   hostname: string;
   group: HostGroup;
-
   requests: number;
   posts: number;
 
@@ -44,84 +58,108 @@ type RequestRecord = {
   ok?: boolean;
 
   postDataBytes?: number;
-
   setCookieNames?: string[];
   setCookieCount?: number;
-
   identifierHits?: IdentifierHit[];
 };
 
 type CookieParty = "firstParty" | "thirdParty";
 type SetterGroup = "root" | "subdomain" | "thirdParty" | "unknown";
 
-type PlatformCookieStats = {
-  total: number;
+type Platform =
+  | "Meta"
+  | "Google Analytics 4"
+  | "Google Ads"
+  | "TikTok"
+  | "Klaviyo"
+  | "Pinterest"
+  | "Microsoft Ads"
+  | "Other";
+type Category = "Advertising" | "Analytics" | "Essential" | "Other";
 
-  // Scope (cookie.domain based)
-  scope: {
-    firstParty: number;
-    thirdParty: number;
-  };
+type TrackingMethod = "Client-side" | "Server-side" | "Client & Server-side";
+type TrackerStatus = "All good" | "Improve" | "Not supported";
 
-  // How it was set (best effort)
-  setMethod: {
-    server: number; // correlated via Set-Cookie
-    client: number; // no server correlation found
-  };
+type ReportCookieRow = {
+  name: string;
+  provider: Platform;
+  category: Category;
+  dataSentTo: string; // ex: "US"
+  lifetimeDays: number | null; // null if session/unknown
+  party: CookieParty;
+  setMethod: "server" | "client";
+  domain: string;
+};
 
-  // Who set it (only meaningful when server-set)
-  serverSetterGroup: Record<SetterGroup, number>;
-
-  // Your key signals
-  firstPartyServerSet: number; // server-set by root/subdomain
-  firstPartyTrackingSubdomainServerSet: number; // server-set by tracking subdomain only
-
-  insecure: number;
-
-  // Debug context (kept small)
-  uniqueCookieNames: number;
-  topCookieNames: Array<{ name: string; count: number }>;
-  domains: {
-    firstParty: string[];
-    thirdParty: string[];
-  };
-  serverSetByHosts: {
-    root: string[];
-    subdomain: string[];
-    thirdParty: string[];
+type TrackerRow = {
+  platform: Platform;
+  category: Category;
+  dataSentTo: string;
+  trackingMethod: TrackingMethod;
+  status: TrackerStatus;
+  evidence: {
+    cookiesMatched: string[];
+    requestHostsMatched: string[];
+    firstPartyRoutedCollectorPosts: number;
   };
 };
 
-// Lowercases and strips www.
+type ScoreBlock = {
+  overall: number; // 0-100
+  analytics: number; // 0-100
+  ads: number; // 0-100
+  cookieLifetime: number; // 0-100
+  pageSpeed: number; // 0-100
+};
+
+type StapeLikeReport = {
+  scores: ScoreBlock;
+  cookies: {
+    total: number;
+    firstParty: number;
+    thirdParty: number;
+    serverSet: number;
+    insecure: number; // hygiene (realistic definition)
+    trackingCookies: ReportCookieRow[]; // curated table rows
+  };
+  trackers: {
+    detected: TrackerRow[];
+    totalDetected: number;
+  };
+  performance: {
+    loadTimeMS: number;
+    transferSizeKB: number;
+  };
+  debug: any; // keep your existing deep metrics here if you want
+};
+
+// -----------------------------
+// Utils
+// -----------------------------
 function normalizeHostname(hostname: string): string {
   let h = (hostname || "").trim().toLowerCase();
   if (h.startsWith("www.")) h = h.slice(4);
   return h;
 }
 
-// Gets the registrable domain (eTLD+1) for a given URL
 function getRegistrableDomain(targetUrl: string): string {
   const u = new URL(targetUrl);
   const parsed = parseTld(u.hostname);
   return normalizeHostname(parsed.domain ?? u.hostname);
 }
 
-// Classifies a hostname as root/subdomain/thirdParty relative to a registrable domain
 function classifyHost(hostname: string, registrableDomain: string): HostGroup {
   const h = normalizeHostname(hostname);
   const rd = normalizeHostname(registrableDomain);
-
   if (h === rd) return "root";
   if (h.endsWith("." + rd)) return "subdomain";
   return "thirdParty";
 }
 
-// Counter increment for stat maps
 function bump(obj: Record<string, number>, key: string, inc = 1) {
   obj[key] = (obj[key] ?? 0) + inc;
 }
 
-// Retrieves existing or initializes new HostStats entry
 function getOrInitHostStats(
   hosts: Map<string, HostStats>,
   hostname: string,
@@ -151,12 +189,6 @@ function safePath(u: URL): string {
   return u.pathname || "/";
 }
 
-/**
- * Split Set-Cookie safely:
- * - Sometimes comes as one combined string (comma-delimited)
- * - Sometimes comes as multiple headers/values
- */
-// Regex to split Set-Cookie headers correctly
 function splitSetCookie(raw: string): string[] {
   return raw
     .split(/,(?=[^ ;]+=)/)
@@ -187,22 +219,36 @@ function isFirstPartyCookieDomain(cookieDomain: string, baseDomain: string) {
   return normalizeHostname(cookieDomain).endsWith(baseDomain);
 }
 
-function uniqPush(arr: string[], value: string, limit = 8) {
-  const v = String(value || "").trim();
-  if (!v) return;
-  if (arr.includes(v)) return;
-  if (arr.length >= limit) return;
-  arr.push(v);
+function clamp(n: number, min = 0, max = 100) {
+  return Math.max(min, Math.min(max, n));
 }
 
-function topN(map: Record<string, number>, n = 6) {
-  return Object.entries(map)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, n)
-    .map(([name, count]) => ({ name, count }));
+function ratio(n: number, d: number) {
+  return d > 0 ? n / d : 0;
 }
 
-// List of common advertising/analytics identifiers
+function saturatingScore(x: number, k = 3) {
+  return clamp((1 - Math.exp(-x / k)) * 100);
+}
+
+function uniq<T>(arr: T[]): T[] {
+  return [...new Set(arr)];
+}
+
+function daysFromCookieExpires(
+  expires: number | undefined | null,
+): number | null {
+  // Playwright cookies: expires is seconds since epoch, or -1 / 0 for session.
+  if (!expires || expires <= 0) return null;
+  const now = Date.now() / 1000;
+  const diff = expires - now;
+  if (diff <= 0) return 0;
+  return Math.round(diff / (60 * 60 * 24));
+}
+
+// -----------------------------
+// Identifier keys
+// -----------------------------
 const IDENTIFIER_KEYS = [
   "gclid",
   "gbraid",
@@ -226,7 +272,6 @@ const IDENTIFIER_KEYS = [
   "email_hash",
 ];
 
-// Detects the presence of keys (never stores values)
 function scanForIdentifiers(opts: {
   url: URL;
   method: string;
@@ -237,13 +282,11 @@ function scanForIdentifiers(opts: {
   const hits: IdentifierHit[] = [];
   const { url, headers, postData, cookieNamesFromResponse } = opts;
 
-  // URL query params
   for (const [k] of url.searchParams.entries()) {
     const key = k.toLowerCase();
     if (IDENTIFIER_KEYS.includes(key)) hits.push({ key, where: "url" });
   }
 
-  // Headers (best effort)
   for (const [hk, hv] of Object.entries(headers)) {
     const hKey = hk.toLowerCase();
     const hVal = (hv ?? "").toLowerCase();
@@ -254,14 +297,12 @@ function scanForIdentifiers(opts: {
     }
   }
 
-  // Cookie names (response)
   for (const name of cookieNamesFromResponse ?? []) {
     const n = name.toLowerCase();
     if (IDENTIFIER_KEYS.includes(n)) hits.push({ key: n, where: "cookieName" });
     if (n.startsWith("_ga_")) hits.push({ key: "_ga", where: "cookieName" });
   }
 
-  // POST body scan (don’t store values; just detect keys)
   if (postData && postData.length) {
     const lower = postData.toLowerCase();
     for (const idKey of IDENTIFIER_KEYS) {
@@ -275,14 +316,14 @@ function scanForIdentifiers(opts: {
     }
   }
 
-  // De-dupe
-  const uniq = new Map<string, IdentifierHit>();
-  for (const h of hits) uniq.set(`${h.key}:${h.where}`, h);
-  return [...uniq.values()];
+  const uniqMap = new Map<string, IdentifierHit>();
+  for (const h of hits) uniqMap.set(`${h.key}:${h.where}`, h);
+  return [...uniqMap.values()];
 }
 
-// ---- Behavior-based tracking heuristics (no fixed subdomain list required)
-// Common urls for event collection endpoints
+// -----------------------------
+// Tracking endpoint hints
+// -----------------------------
 const COLLECTOR_PATH_HINTS = [
   "/collect",
   "/g/collect",
@@ -315,21 +356,267 @@ function hostLooksLikeTracking(stat: HostStats): boolean {
   );
 }
 
-// ---- Scoring helpers (Stape-style)
-function clamp(n: number, min = 0, max = 100) {
-  return Math.max(min, Math.min(max, n));
+// -----------------------------
+// Cookie Catalog (dictionary)
+// This is what makes you "Stape-like".
+// -----------------------------
+type CookieCatalogEntry = {
+  provider: Platform;
+  category: Category;
+  dataSentTo: string; // "US" default
+  // match either exact or regex
+  match: (cookieName: string) => boolean;
+  // optional preferred lifetime in days if you want a fallback
+  defaultLifetimeDays?: number;
+};
+
+const COOKIE_CATALOG: CookieCatalogEntry[] = [
+  // --- Meta
+  {
+    provider: "Meta",
+    category: "Advertising",
+    dataSentTo: "US",
+    match: (n) => n === "_fbp",
+    defaultLifetimeDays: 365,
+  },
+  {
+    provider: "Meta",
+    category: "Advertising",
+    dataSentTo: "US",
+    match: (n) => n === "_fbc",
+    defaultLifetimeDays: 90,
+  },
+
+  // --- GA4 / Google Analytics
+  {
+    provider: "Google Analytics 4",
+    category: "Analytics",
+    dataSentTo: "US",
+    match: (n) => n === "FPID",
+    defaultLifetimeDays: 365,
+  },
+  {
+    provider: "Google Analytics 4",
+    category: "Analytics",
+    dataSentTo: "US",
+    match: (n) => n === "_ga",
+    defaultLifetimeDays: 365,
+  },
+  {
+    provider: "Google Analytics 4",
+    category: "Analytics",
+    dataSentTo: "US",
+    match: (n) => /^_ga_.+/.test(n),
+    defaultLifetimeDays: 365,
+  },
+
+  // --- Google Ads (common attribution cookies)
+  {
+    provider: "Google Ads",
+    category: "Advertising",
+    dataSentTo: "US",
+    match: (n) => n === "_gcl_aw",
+    defaultLifetimeDays: 7,
+  },
+  {
+    provider: "Google Ads",
+    category: "Advertising",
+    dataSentTo: "US",
+    match: (n) => n === "_gcl_gb",
+    defaultLifetimeDays: 7,
+  },
+  {
+    provider: "Google Ads",
+    category: "Advertising",
+    dataSentTo: "US",
+    match: (n) => n === "_gcl_au",
+    defaultLifetimeDays: 90,
+  }, // often 90
+  {
+    provider: "Google Ads",
+    category: "Advertising",
+    dataSentTo: "US",
+    match: (n) => n === "FPGCLAW",
+    defaultLifetimeDays: 90,
+  },
+  {
+    provider: "Google Ads",
+    category: "Advertising",
+    dataSentTo: "US",
+    match: (n) => n === "FPGCLGB",
+    defaultLifetimeDays: 90,
+  },
+  {
+    provider: "Google Ads",
+    category: "Advertising",
+    dataSentTo: "US",
+    match: (n) => n === "FPAU",
+    defaultLifetimeDays: 365,
+  },
+
+  // --- Klaviyo
+  {
+    provider: "Klaviyo",
+    category: "Advertising",
+    dataSentTo: "US",
+    match: (n) => n === "__kla_id",
+    defaultLifetimeDays: 400,
+  },
+
+  // --- Pinterest
+  {
+    provider: "Pinterest",
+    category: "Advertising",
+    dataSentTo: "US",
+    match: (n) => n === "_epik",
+    defaultLifetimeDays: 365,
+  },
+
+  // --- TikTok (basic)
+  {
+    provider: "TikTok",
+    category: "Advertising",
+    dataSentTo: "US",
+    match: (n) => n === "_ttp",
+    defaultLifetimeDays: 400,
+  },
+  {
+    provider: "TikTok",
+    category: "Advertising",
+    dataSentTo: "US",
+    match: (n) => n.startsWith("tt_"),
+    defaultLifetimeDays: 30,
+  },
+
+  // --- Microsoft Ads (basic)
+  {
+    provider: "Microsoft Ads",
+    category: "Advertising",
+    dataSentTo: "US",
+    match: (n) => n === "_uetsid",
+    defaultLifetimeDays: 30,
+  },
+  {
+    provider: "Microsoft Ads",
+    category: "Advertising",
+    dataSentTo: "US",
+    match: (n) => n === "_uetvid",
+    defaultLifetimeDays: 390,
+  },
+];
+
+// request-domain evidence for tracker detection
+type TrackerCatalogEntry = {
+  platform: Platform;
+  category: Category;
+  dataSentTo: string;
+  requestHostPatterns: RegExp[];
+  supportsServerSide: boolean;
+  cookieMatchProviders: Platform[]; // which providers in cookie table map to this tracker
+};
+
+const TRACKER_CATALOG: TrackerCatalogEntry[] = [
+  {
+    platform: "Meta",
+    category: "Advertising",
+    dataSentTo: "US",
+    requestHostPatterns: [
+      /facebook\.com/i,
+      /fbcdn\.net/i,
+      /connect\.facebook\.net/i,
+      /graph\.facebook\.com/i,
+    ],
+    supportsServerSide: true,
+    cookieMatchProviders: ["Meta"],
+  },
+  {
+    platform: "Google Analytics 4",
+    category: "Analytics",
+    dataSentTo: "US",
+    requestHostPatterns: [
+      /google-analytics\.com/i,
+      /analytics\.google\.com/i,
+      /googletagmanager\.com/i,
+    ],
+    supportsServerSide: true,
+    cookieMatchProviders: ["Google Analytics 4"],
+  },
+  {
+    platform: "Google Ads",
+    category: "Advertising",
+    dataSentTo: "US",
+    requestHostPatterns: [
+      /doubleclick\.net/i,
+      /googleadservices\.com/i,
+      /googlesyndication\.com/i,
+    ],
+    supportsServerSide: true,
+    cookieMatchProviders: ["Google Ads"],
+  },
+  {
+    platform: "Klaviyo",
+    category: "Advertising",
+    dataSentTo: "US",
+    requestHostPatterns: [/klaviyo\.com/i, /klaviyomail\.com/i],
+    supportsServerSide: true,
+    cookieMatchProviders: ["Klaviyo"],
+  },
+  {
+    platform: "Pinterest",
+    category: "Advertising",
+    dataSentTo: "US",
+    requestHostPatterns: [/pinterest\.com/i, /ct\.pinterest\.com/i],
+    supportsServerSide: true,
+    cookieMatchProviders: ["Pinterest"],
+  },
+  {
+    platform: "TikTok",
+    category: "Advertising",
+    dataSentTo: "US",
+    requestHostPatterns: [
+      /tiktok\.com/i,
+      /ads\.tiktok\.com/i,
+      /business\.tiktok\.com/i,
+    ],
+    supportsServerSide: true,
+    cookieMatchProviders: ["TikTok"],
+  },
+  {
+    platform: "Microsoft Ads",
+    category: "Advertising",
+    dataSentTo: "US",
+    requestHostPatterns: [/bing\.com/i, /bat\.bing\.com/i],
+    supportsServerSide: false, // matches your screenshot language ("not supported")
+    cookieMatchProviders: ["Microsoft Ads"],
+  },
+];
+
+// -----------------------------
+// Main
+// -----------------------------
+
+// Optional: run second navigation with synthetic click IDs (closer to Stape).
+// Set to true if you want to try to force creation of _fbc, _gcl_aw/_gcl_gb, etc.
+const RUN_ATTRIBUTION_SIMULATION = true;
+
+function withSyntheticClickIds(urlStr: string) {
+  const u = new URL(urlStr);
+  // only add if not present
+  if (!u.searchParams.has("gclid")) u.searchParams.set("gclid", "TEST_GCLID");
+  if (!u.searchParams.has("gbraid"))
+    u.searchParams.set("gbraid", "TEST_GBRAID");
+  if (!u.searchParams.has("wbraid"))
+    u.searchParams.set("wbraid", "TEST_WBRAID");
+  if (!u.searchParams.has("fbclid"))
+    u.searchParams.set("fbclid", "TEST_FBCLID");
+  if (!u.searchParams.has("msclkid"))
+    u.searchParams.set("msclkid", "TEST_MSCLKID");
+  if (!u.searchParams.has("ttclid"))
+    u.searchParams.set("ttclid", "TEST_TTCLID");
+  return u.toString();
 }
 
-function ratio(n: number, d: number) {
-  return d > 0 ? n / d : 0;
-}
-
-// Smooth saturating curve for count signals.
-function saturatingScore(x: number, k = 3) {
-  return clamp((1 - Math.exp(-x / k)) * 100);
-}
-
-export async function runAudit(targetUrl: string) {
+export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
   const browser: Browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox"],
@@ -339,35 +626,21 @@ export async function runAudit(targetUrl: string) {
     const context = await browser.newContext();
     const page = await context.newPage();
 
-    // First vs third-party classification
     const baseDomain = getRegistrableDomain(targetUrl);
 
-    // ---- Request/endpoint mapping storage
     const requestRecords: RequestRecord[] = [];
     const hosts = new Map<string, HostStats>();
     const reqToIndex = new Map<Request, number>();
 
-    // ---- Cookie storage
     const allServerCookies: Array<{
-      cookie: string; // "name=value"
-      domain: string; // parsed Domain= attr or fallback host
-      setBy: string; // response hostname
+      cookie: string;
+      domain: string;
+      setBy: string;
       source: "server-set";
     }> = [];
     const browserCookies: any[] = [];
 
-    // ---- Platform patterns (cookie-based)
-    const PLATFORM_PATTERNS: Record<string, RegExp[]> = {
-      Facebook: [/facebook\.com/, /fbp/, /fbc/],
-      Google: [/google\.com/, /gcl_/, /_ga/, /_gid/],
-      TikTok: [/tiktok\.com/, /tt_/, /_ttp/],
-      Klaviyo: [/klaviyo\.com/, /_kla_id/],
-      Pinterest: [/pinterest\.com/, /_pin_/, /_pinterest/],
-      Snap: [/snapchat\.com/, /sc_/, /_scid/],
-      Other: [],
-    };
-
-    // ---- Request listener: collect URLs, methods, identifiers, and host stats
+    // ---- Request listener
     page.on("request", (req) => {
       try {
         const url = new URL(req.url());
@@ -376,7 +649,6 @@ export async function runAudit(targetUrl: string) {
 
         const method = req.method();
         const headers = req.headers();
-
         const postData = req.postData() ?? null;
         const postDataBytes = postData
           ? Buffer.byteLength(postData, "utf8")
@@ -416,7 +688,7 @@ export async function runAudit(targetUrl: string) {
       }
     });
 
-    // ---- Response listener: capture status and server-set cookies
+    // ---- Response listener (Set-Cookie correlation)
     page.on("response", async (resp: Response) => {
       try {
         const url = new URL(resp.url());
@@ -426,7 +698,6 @@ export async function runAudit(targetUrl: string) {
         const headers = await resp.allHeaders();
         const req = resp.request();
 
-        // enrich request record
         const idx = reqToIndex.get(req);
         const record = idx !== undefined ? requestRecords[idx] : undefined;
         if (record) {
@@ -434,7 +705,6 @@ export async function runAudit(targetUrl: string) {
           record.ok = resp.ok();
         }
 
-        // Set-Cookie
         const setCookieHeader =
           (headers as any)["set-cookie"] ?? (headers as any)["Set-Cookie"];
 
@@ -455,25 +725,22 @@ export async function runAudit(targetUrl: string) {
             );
 
             allServerCookies.push({
-              cookie: (line.split(";")[0] ?? "").trim(), // "name=value"
+              cookie: (line.split(";")[0] ?? "").trim(),
               domain: cookieDomain,
               setBy: hostname,
               source: "server-set",
             });
           });
 
-          // update host stats
           const stat = getOrInitHostStats(hosts, hostname, group);
           stat.setCookieResponses += 1;
           stat.setCookieCount += cookieNamesForThisResponse.length;
           for (const n of cookieNamesForThisResponse) bump(stat.cookieNames, n);
 
-          // update request record
           if (record) {
             record.setCookieNames = cookieNamesForThisResponse;
             record.setCookieCount = cookieNamesForThisResponse.length;
 
-            // identifier scan using cookie names too
             const extraHits = scanForIdentifiers({
               url: new URL(record.url),
               method: record.method,
@@ -488,7 +755,7 @@ export async function runAudit(targetUrl: string) {
             for (const h of extraHits) merged.set(`${h.key}:${h.where}`, h);
             record.identifierHits = [...merged.values()];
 
-            // rebuild per-host identifier counts (MVP safe)
+            // rebuild per-host identifier counts
             stat.identifierHits = 0;
             stat.identifierKeys = {};
             for (const r of requestRecords) {
@@ -505,7 +772,7 @@ export async function runAudit(targetUrl: string) {
       }
     });
 
-    // ---- Load page
+    // ---- Navigation pass #1
     const start = Date.now();
     try {
       await page.goto(targetUrl, {
@@ -515,28 +782,38 @@ export async function runAudit(targetUrl: string) {
       await page
         .waitForLoadState("networkidle", { timeout: 15000 })
         .catch(() => {});
-    } catch (err) {
-      console.warn(
-        `⚠️ Navigation warning for ${targetUrl}:`,
-        (err as Error).message,
-      );
+    } catch {
+      // ignore
     }
     const loadTimeMS = Date.now() - start;
 
-    // ---- Light interaction to trigger more tags (optional but helpful)
+    // ---- small interaction
     try {
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(1500);
       await page.mouse.wheel(0, 1200);
-      await page.waitForTimeout(2000);
-    } catch {
-      /* ignore */
+      await page.waitForTimeout(1500);
+    } catch {}
+
+    // ---- Optional navigation pass #2 (synthetic click IDs)
+    if (RUN_ATTRIBUTION_SIMULATION) {
+      try {
+        const testUrl = withSyntheticClickIds(targetUrl);
+        await page.goto(testUrl, {
+          waitUntil: "domcontentloaded",
+          timeout: 45000,
+        });
+        await page
+          .waitForLoadState("networkidle", { timeout: 15000 })
+          .catch(() => {});
+        await page.waitForTimeout(1500);
+      } catch {}
     }
 
-    // ---- Collect browser cookies
+    // ---- collect cookies
     const cookies = await context.cookies();
     cookies.forEach((c) => browserCookies.push(c));
 
-    // ---- Correlate browser cookies to server-set cookies (STRONGER matching)
+    // Correlate browser cookies to server-set cookies
     browserCookies.forEach((c) => {
       const match = allServerCookies.find((s) => {
         const serverName = s.cookie.split("=")[0];
@@ -544,30 +821,16 @@ export async function runAudit(targetUrl: string) {
 
         const cd = normalizeHostname(String(c.domain ?? "")).replace(/^\./, "");
         const sd = normalizeHostname(String(s.domain ?? "")).replace(/^\./, "");
-
-        // cookie domain must be equal or a parent/child relationship
         return cd === sd || cd.endsWith("." + sd) || sd.endsWith("." + cd);
       });
 
       if (match) {
-        c.setByServer = match.setBy; // response hostname that set it
-        c.setCookieDomain = match.domain; // parsed Domain= attr (or fallback)
+        c.setByServer = match.setBy;
+        c.setCookieDomain = match.domain;
       }
     });
 
-    // ---- Platform classification (cookie name/domain)
-    function detectPlatform(cookieName: string, cookieDomain: string): string {
-      for (const [platform, patterns] of Object.entries(PLATFORM_PATTERNS)) {
-        if (patterns.some((re) => re.test(cookieName) || re.test(cookieDomain)))
-          return platform;
-      }
-      return "Other";
-    }
-    browserCookies.forEach(
-      (c) => (c.platform = detectPlatform(c.name, c.domain)),
-    );
-
-    // ---- Build endpoint grouping
+    // ---- endpoints grouping
     const endpoints = {
       root: {} as Record<string, HostStats>,
       subdomains: {} as Record<string, HostStats>,
@@ -581,45 +844,35 @@ export async function runAudit(targetUrl: string) {
       else endpoints.thirdParty[stat.hostname] = stat;
     }
 
-    // ---- Behavior-based “first-party routed tracking endpoint” detection
+    // behavior-based first-party routed collector hosts
     const trackingFirstPartySubdomains = Object.values(
       endpoints.subdomains,
-    ).filter((s) => hostLooksLikeTracking(s));
-    const trackingRoot = Object.values(endpoints.root).filter((s) =>
-      hostLooksLikeTracking(s),
+    ).filter(hostLooksLikeTracking);
+    const trackingRoot = Object.values(endpoints.root).filter(
+      hostLooksLikeTracking,
     );
 
     const trackingHosts = new Set<string>([
-      ...trackingFirstPartySubdomains.map((h) => h.hostname),
-      ...trackingRoot.map((h) => h.hostname),
+      ...trackingFirstPartySubdomains.map((h) => normalizeHostname(h.hostname)),
+      ...trackingRoot.map((h) => normalizeHostname(h.hostname)),
     ]);
 
-    // ✅ first-party tracking subdomain hostnames ONLY
     const trackingFirstPartySubdomainHosts = new Set<string>(
       trackingFirstPartySubdomains.map((h) => normalizeHostname(h.hostname)),
     );
 
-    // ---- Beacon breakdown (NOTE: these are *browser* requests; treat as “first-party routed” vs “third-party”)
-    let computedFirstPartyRouted = 0;
-    let computedThirdParty = 0;
-
-    for (const r of requestRecords) {
-      if (r.group === "thirdParty") {
-        computedThirdParty++;
-        continue;
-      }
-      if (trackingHosts.has(r.hostname)) computedFirstPartyRouted++;
-    }
-
-    // ---- Cookie metrics
+    // ---- Cookie party & server set counts
     const firstPartyCookies = browserCookies.filter((c) =>
       normalizeHostname(c.domain).endsWith(baseDomain),
     );
-
     const thirdPartyCookies = browserCookies.filter(
       (c) => !normalizeHostname(c.domain).endsWith(baseDomain),
     );
+    const serverSetCookies = browserCookies.filter((c) =>
+      Boolean(c.setByServer),
+    );
 
+    // ---- "insecure" (realistic definition)
     const isHttps = (() => {
       try {
         return new URL(targetUrl).protocol === "https:";
@@ -628,339 +881,357 @@ export async function runAudit(targetUrl: string) {
       }
     })();
 
+    // insecure = missing Secure on https OR SameSite=None without Secure
     const insecureCookies = browserCookies.filter((c) => {
-      const sameSite = String(c.sameSite ?? "");
       const secure = Boolean(c.secure);
-
-      // If the site is HTTPS, cookies should generally be Secure
+      const sameSite = String(c.sameSite ?? "");
       if (isHttps && !secure) return true;
-
-      // SameSite=None MUST be Secure, or browsers reject / downgrade it
       if (sameSite === "None" && !secure) return true;
-
       return false;
     });
 
-    const serverSetCookies = browserCookies.filter((c) => c.setByServer);
-
-    // ✅ First-party tracking subdomain cookies (server-set correlation)
-    const firstPartyTrackingSubdomainCookies = browserCookies.filter((c) => {
-      const setBy = normalizeHostname(c.setByServer ?? "");
-      if (!setBy) return false;
-      if (!trackingFirstPartySubdomainHosts.has(setBy)) return false;
-      return normalizeHostname(c.domain).endsWith(baseDomain);
-    });
-
-    // "First-party server cookies" = cookies set by any first-party host (root OR any subdomain)
-    const firstPartyHostnames = new Set<string>([
-      ...Object.keys(endpoints.root),
-      ...Object.keys(endpoints.subdomains),
-    ]);
-
-    const firstPartyServerCookies = browserCookies.filter((c) => {
-      const setBy = normalizeHostname(c.setByServer ?? "");
-      return setBy.length > 0 && firstPartyHostnames.has(setBy);
-    });
-
-    // ---- Cookies by platform (detailed)
-    const cookiesByPlatformDetailed: Record<string, PlatformCookieStats> = {};
-
-    function classifySetterGroup(
-      setByHost: string | undefined | null,
-    ): SetterGroup {
-      const h = normalizeHostname(setByHost ?? "");
-      if (!h) return "unknown";
-      return classifyHost(h, baseDomain);
-    }
-
-    function initPlatformStats(): PlatformCookieStats {
-      return {
-        total: 0,
-        scope: { firstParty: 0, thirdParty: 0 },
-        setMethod: { server: 0, client: 0 },
-        serverSetterGroup: {
-          root: 0,
-          subdomain: 0,
-          thirdParty: 0,
-          unknown: 0,
-        },
-        firstPartyServerSet: 0,
-        firstPartyTrackingSubdomainServerSet: 0,
-        insecure: 0,
-        uniqueCookieNames: 0,
-        topCookieNames: [],
-        domains: { firstParty: [], thirdParty: [] },
-        serverSetByHosts: { root: [], subdomain: [], thirdParty: [] },
-      };
-    }
-
-    const platformNameCounts: Record<string, Record<string, number>> = {};
-
-    for (const c of browserCookies) {
-      const platform = c.platform || "Other";
-      if (!cookiesByPlatformDetailed[platform]) {
-        cookiesByPlatformDetailed[platform] = initPlatformStats();
-        platformNameCounts[platform] = {};
+    // ---- Curate "tracking cookies" like Stape does
+    function catalogMatch(name: string): CookieCatalogEntry | null {
+      const n = String(name || "").trim();
+      for (const entry of COOKIE_CATALOG) {
+        if (entry.match(n)) return entry;
       }
+      return null;
+    }
 
-      const stats = cookiesByPlatformDetailed[platform];
-      stats.total += 1;
+    // build rows only for catalog cookies we saw
+    const trackingCookieRows: ReportCookieRow[] = [];
+    for (const c of browserCookies) {
+      const entry = catalogMatch(c.name);
+      if (!entry) continue;
 
-      // Scope party (cookie.domain)
-      const scopeParty: CookieParty = isFirstPartyCookieDomain(
-        c.domain,
-        baseDomain,
-      )
+      const party: CookieParty = isFirstPartyCookieDomain(c.domain, baseDomain)
         ? "firstParty"
         : "thirdParty";
+      const setMethod: "server" | "client" = c.setByServer
+        ? "server"
+        : "client";
 
-      stats.scope[scopeParty] += 1;
-      if (scopeParty === "firstParty")
-        uniqPush(stats.domains.firstParty, normalizeHostname(c.domain));
-      else uniqPush(stats.domains.thirdParty, normalizeHostname(c.domain));
+      const lifetime = daysFromCookieExpires(c.expires);
+      const lifetimeDays = lifetime ?? entry.defaultLifetimeDays ?? null;
 
-      // Insecure
-      const insecure = c.sameSite === "None" || !c.secure;
-      if (insecure) stats.insecure += 1;
-
-      // Set method + setter host grouping
-      const isServer = Boolean(c.setByServer);
-      if (isServer) {
-        stats.setMethod.server += 1;
-
-        const setterGroup = classifySetterGroup(c.setByServer);
-        stats.serverSetterGroup[setterGroup] += 1;
-
-        const sb = normalizeHostname(c.setByServer);
-        if (setterGroup === "root") uniqPush(stats.serverSetByHosts.root, sb);
-        else if (setterGroup === "subdomain")
-          uniqPush(stats.serverSetByHosts.subdomain, sb);
-        else if (setterGroup === "thirdParty")
-          uniqPush(stats.serverSetByHosts.thirdParty, sb);
-
-        if (setterGroup === "root" || setterGroup === "subdomain") {
-          stats.firstPartyServerSet += 1;
-        }
-
-        if (trackingFirstPartySubdomainHosts.has(sb)) {
-          stats.firstPartyTrackingSubdomainServerSet += 1;
-        }
-      } else {
-        stats.setMethod.client += 1;
-      }
-
-      // Top cookie name counts
-      const nameKey = String(c.name ?? "");
-      platformNameCounts[platform][nameKey] =
-        (platformNameCounts[platform][nameKey] ?? 0) + 1;
+      trackingCookieRows.push({
+        name: c.name,
+        provider: entry.provider,
+        category: entry.category,
+        dataSentTo: entry.dataSentTo,
+        lifetimeDays,
+        party,
+        setMethod,
+        domain: String(c.domain ?? ""),
+      });
     }
 
-    for (const [platform, stats] of Object.entries(cookiesByPlatformDetailed)) {
-      const nameMap = platformNameCounts[platform] ?? {};
-      stats.uniqueCookieNames = Object.keys(nameMap).length;
-      stats.topCookieNames = topN(nameMap, 6);
-    }
+    // De-dupe rows by cookie name (keep first)
+    const seen = new Set<string>();
+    const dedupedTrackingCookieRows = trackingCookieRows.filter((r) => {
+      if (seen.has(r.name)) return false;
+      seen.add(r.name);
+      return true;
+    });
 
-    // compact shape (backwards compatible)
-    const cookiesByPlatform: Record<
-      string,
-      { firstParty: number; thirdParty: number }
-    > = {};
-    for (const [platform, stats] of Object.entries(cookiesByPlatformDetailed)) {
-      cookiesByPlatform[platform] = {
-        firstParty: stats.scope.firstParty,
-        thirdParty: stats.scope.thirdParty,
-      };
-    }
-
-    // -------------------------
-    // Stape-style scoring signals
-    // -------------------------
-    const totalRequests = requestRecords.length || 1;
-
-    const firstPartyRequests = requestRecords.filter(
-      (r) => r.group !== "thirdParty",
+    // ---- Determine per-platform tracker detection (cookie + request evidence)
+    const requestHostnames = requestRecords.map((r) =>
+      normalizeHostname(r.hostname),
     );
-    const thirdPartyRequests = requestRecords.filter(
-      (r) => r.group === "thirdParty",
-    );
+    const thirdPartyRequestHostnames = requestRecords
+      .filter((r) => r.group === "thirdParty")
+      .map((r) => normalizeHostname(r.hostname));
 
-    const firstPartyPOSTs = firstPartyRequests.filter(
-      (r) => r.method === "POST",
-    );
+    // First-party collector POSTs
+    const firstPartyCollectorHosts = trackingHosts; // first-party routed collectors on your domain/subdomain
+    const firstPartyCollectorPOSTs = requestRecords.filter((r) => {
+      if (r.group === "thirdParty") return false;
+      if (r.method !== "POST") return false;
+      return firstPartyCollectorHosts.has(normalizeHostname(r.hostname));
+    });
 
-    const firstPartyCollectorHosts = new Set<string>([
-      ...trackingRoot.map((h) => normalizeHostname(h.hostname)),
-      ...trackingFirstPartySubdomains.map((h) => normalizeHostname(h.hostname)),
-    ]);
-
-    const firstPartyCollectorPOSTs = firstPartyPOSTs.filter((r) =>
-      firstPartyCollectorHosts.has(normalizeHostname(r.hostname)),
-    );
-
-    const fpCollectorIdHits = firstPartyCollectorPOSTs.reduce((acc, r) => {
-      return acc + (r.identifierHits?.length ?? 0);
-    }, 0);
-
+    // Identifier keys on first-party collector posts (for “server-side signal” per platform)
     const fpCollectorIdKeys = new Set<string>();
     for (const r of firstPartyCollectorPOSTs) {
       for (const hit of r.identifierHits ?? []) fpCollectorIdKeys.add(hit.key);
     }
-    const fpCollectorIdKeyCount = fpCollectorIdKeys.size;
 
-    const thirdPartyShare = ratio(thirdPartyRequests.length, totalRequests);
-
-    const insecureRatio =
-      browserCookies.length > 0
-        ? insecureCookies.length / browserCookies.length
-        : 1;
-
-    const fpServerSetCookies = firstPartyServerCookies.length;
-    const fpTrackingServerSetCookies =
-      firstPartyTrackingSubdomainCookies.length;
-
-    // ---- Scoring (closer to Stape feel)
-    let routingStrength = 0;
-    routingStrength +=
-      0.75 * saturatingScore(firstPartyCollectorPOSTs.length, 2.5);
-    routingStrength += firstPartyCollectorHosts.size > 0 ? 15 : 0;
-    routingStrength = clamp(routingStrength);
-
-    let identifierContinuity = 0;
-    identifierContinuity += 0.75 * saturatingScore(fpCollectorIdKeyCount, 2);
-    identifierContinuity += 0.25 * saturatingScore(fpCollectorIdHits, 6);
-    identifierContinuity = clamp(identifierContinuity);
-
-    let cookieQuality = 0;
-    cookieQuality += 0.55 * saturatingScore(fpServerSetCookies, 3);
-    cookieQuality += 0.35 * saturatingScore(fpTrackingServerSetCookies, 2);
-    cookieQuality += 0.1 * clamp((1 - insecureRatio) * 100);
-    cookieQuality = clamp(cookieQuality);
-
-    const thirdPartyReliance = clamp(thirdPartyShare * 100);
-
-    let overall =
-      0.4 * routingStrength +
-      0.25 * identifierContinuity +
-      0.2 * cookieQuality +
-      0.15 * (100 - thirdPartyReliance);
-
-    overall = clamp(overall);
-    const overallScore = Math.round(overall);
-
-    let technical =
-      0.5 * cookieQuality +
-      0.35 * routingStrength +
-      0.15 * clamp((1 - insecureRatio) * 100);
-
-    technical = clamp(technical);
-
-    let firstPartyBias =
-      0.55 * routingStrength +
-      0.3 * saturatingScore(fpTrackingServerSetCookies, 2) +
-      0.15 * saturatingScore(fpServerSetCookies, 3);
-
-    firstPartyBias = clamp(firstPartyBias);
-
-    let potentialWithFirstParty = clamp(100 - overall, 0, 100);
-    if (routingStrength > 70) potentialWithFirstParty -= 10;
-    if (routingStrength > 85) potentialWithFirstParty -= 10;
-    potentialWithFirstParty = clamp(potentialWithFirstParty, 35, 95);
-
-    const scores = {
-      technical: Math.round(technical),
-      firstPartyBias: Math.round(firstPartyBias),
-      potentialWithFirstParty: Math.round(potentialWithFirstParty),
+    // Platform-specific identifier keys (very important for “server-side detected” feel)
+    const PLATFORM_ID_KEYS: Record<Platform, string[]> = {
+      Meta: ["fbclid", "fbp", "fbc"],
+      "Google Analytics 4": ["_ga", "cid", "client_id", "clientid"],
+      "Google Ads": ["gclid", "gbraid", "wbraid"],
+      TikTok: ["ttclid"],
+      Klaviyo: ["external_id", "email_hash"],
+      Pinterest: ["epik", "external_id"],
+      "Microsoft Ads": ["msclkid"],
+      Other: [],
     };
 
-    // A small “health” metric you had before (kept, but now just a driver)
-    const cookieHealthScore =
-      (firstPartyTrackingSubdomainCookies.length /
-        (browserCookies.length || 1)) *
-      100;
+    function platformHasServerSignal(p: Platform) {
+      const keys = PLATFORM_ID_KEYS[p] ?? [];
+      if (!keys.length) return false;
+      for (const k of keys) {
+        if (fpCollectorIdKeys.has(k)) return true;
+      }
+      return false;
+    }
 
-    // ---- Output
-    const result = {
-      summary: {
-        url: targetUrl,
-        title: await page.title().catch(() => ""),
-        timestamp: new Date().toISOString(),
-        baseDomain,
-      },
-      performance: {
-        loadTimeMS,
-        transferSizeKB: Math.round((await page.content()).length / 1024),
-      },
-      tracking: {
-        // These are browser requests. Treat “server” as “first-party routed” for UI wording.
-        beaconBreakdown: {
-          firstPartyRouted: computedFirstPartyRouted,
-          thirdParty: computedThirdParty,
-          total: requestRecords.length,
+    // cookie evidence grouped by platform
+    const cookiesByProvider: Record<string, string[]> = {};
+    for (const row of dedupedTrackingCookieRows) {
+      cookiesByProvider[row.provider] = cookiesByProvider[row.provider] ?? [];
+      cookiesByProvider[row.provider].push(row.name);
+    }
+
+    // request evidence grouped by platform (third-party hosts that match platform patterns)
+    function hostsMatching(patterns: RegExp[]): string[] {
+      return uniq(
+        thirdPartyRequestHostnames.filter((h) =>
+          patterns.some((re) => re.test(h)),
+        ),
+      );
+    }
+
+    const trackersDetected: TrackerRow[] = [];
+    for (const t of TRACKER_CATALOG) {
+      const cookieEvidence = uniq(
+        (cookiesByProvider[t.platform] ?? []).filter(Boolean),
+      );
+
+      const requestEvidence = hostsMatching(t.requestHostPatterns);
+
+      const detected = cookieEvidence.length > 0 || requestEvidence.length > 0;
+      if (!detected) continue;
+
+      // Determine tracking method:
+      // - Client-side if only third-party network / only client cookies
+      // - Server-side if first-party collector exists AND platform server signal present
+      // - Both if both detected
+      const hasClient = requestEvidence.length > 0 || cookieEvidence.length > 0;
+      const hasServer =
+        firstPartyCollectorPOSTs.length > 0 &&
+        platformHasServerSignal(t.platform);
+
+      let trackingMethod: TrackingMethod = "Client-side";
+      if (hasServer && hasClient) trackingMethod = "Client & Server-side";
+      else if (hasServer) trackingMethod = "Server-side";
+
+      // Status:
+      // - if platform doesn't support server-side in your product: show not supported
+      // - else if ads platform and only client-side => Improve
+      // - else All good
+      let status: TrackerStatus = "All good";
+
+      if (!t.supportsServerSide) {
+        status = "Not supported";
+      } else {
+        // If it’s an ads tracker and only client-side, call Improve
+        const isAds = t.category === "Advertising";
+        if (isAds && trackingMethod === "Client-side") status = "Improve";
+        if (t.platform === "Klaviyo" && trackingMethod === "Client-side")
+          status = "Improve";
+      }
+
+      trackersDetected.push({
+        platform: t.platform,
+        category: t.category,
+        dataSentTo: t.dataSentTo,
+        trackingMethod,
+        status,
+        evidence: {
+          cookiesMatched: cookieEvidence,
+          requestHostsMatched: requestEvidence,
+          firstPartyRoutedCollectorPosts: firstPartyCollectorPOSTs.length,
         },
-        // Optional debug:
-        // trackingHosts: Array.from(trackingHosts),
-        // trackingFirstPartySubdomainHosts: Array.from(trackingFirstPartySubdomainHosts),
+      });
+    }
+
+    // -----------------------------
+    // Stape-like score construction
+    // -----------------------------
+
+    // Page speed score (simple: based on loadTimeMS)
+    // adjust breakpoints to taste; this is roughly “fast/ok/slow”
+    const pageSpeed = (() => {
+      const ms = loadTimeMS;
+      if (ms <= 2000) return 95;
+      if (ms <= 4000) return 85;
+      if (ms <= 7000) return 75;
+      if (ms <= 12000) return 65;
+      if (ms <= 20000) return 55;
+      return 45;
+    })();
+
+    // Cookie lifetime score:
+    // Stape’s “cookie lifetime” looks like a quality score, not just average days.
+    // We:
+    // - reward presence of key attribution cookies
+    // - mildly penalize if key cookies are session/very short
+    const cookieLifetime = (() => {
+      const keyCookies = dedupedTrackingCookieRows;
+
+      // if none, low
+      if (!keyCookies.length) return 35;
+
+      // basic presence score
+      let score = 70;
+
+      // reward having multiple long-lived cookies
+      const longLived = keyCookies.filter(
+        (c) => (c.lifetimeDays ?? 0) >= 90,
+      ).length;
+      score += Math.min(20, longLived * 5);
+
+      // penalize session/short-lived
+      const shortLived = keyCookies.filter(
+        (c) => c.lifetimeDays === null || (c.lifetimeDays ?? 0) < 7,
+      ).length;
+      score -= Math.min(25, shortLived * 6);
+
+      return clamp(score, 0, 100);
+    })();
+
+    // Analytics score:
+    // presence of GA4 cookies + “server signal” for GA4
+    const analytics = (() => {
+      const gaCookies = dedupedTrackingCookieRows.filter(
+        (c) => c.provider === "Google Analytics 4",
+      );
+      let score = 40;
+
+      if (gaCookies.find((c) => c.name === "_ga")) score += 25;
+      if (gaCookies.find((c) => c.name.startsWith("_ga_"))) score += 15;
+      if (gaCookies.find((c) => c.name === "FPID")) score += 15;
+
+      // server routing signal
+      if (
+        platformHasServerSignal("Google Analytics 4") &&
+        firstPartyCollectorPOSTs.length > 0
+      )
+        score += 15;
+
+      return clamp(score, 0, 100);
+    })();
+
+    // Ads score:
+    // treat Meta + Google Ads + Pinterest + TikTok + Klaviyo as "ads ecosystem"
+    const ads = (() => {
+      const adsTrackers = trackersDetected.filter(
+        (t) => t.category === "Advertising",
+      );
+      if (!adsTrackers.length) return 35;
+
+      let score = 55;
+
+      // reward breadth
+      score += Math.min(20, adsTrackers.length * 4);
+
+      // reward server-side methods
+      const serverOrBoth = adsTrackers.filter(
+        (t) =>
+          t.trackingMethod === "Server-side" ||
+          t.trackingMethod === "Client & Server-side",
+      ).length;
+      score += Math.min(25, serverOrBoth * 6);
+
+      // penalize lots of client-only
+      const clientOnly = adsTrackers.filter(
+        (t) => t.trackingMethod === "Client-side",
+      ).length;
+      score -= Math.min(20, clientOnly * 5);
+
+      return clamp(score, 0, 100);
+    })();
+
+    // Overall:
+    const overall = (() => {
+      // small hygiene penalty
+      const insecureRatio = ratio(
+        insecureCookies.length,
+        browserCookies.length || 1,
+      );
+      const hygienePenalty = clamp(insecureRatio * 25, 0, 25);
+
+      // third-party reliance penalty
+      const totalReq = requestRecords.length || 1;
+      const thirdPartyReq = requestRecords.filter(
+        (r) => r.group === "thirdParty",
+      ).length;
+      const thirdPartyPenalty = clamp(
+        ratio(thirdPartyReq, totalReq) * 20,
+        0,
+        20,
+      );
+
+      // routing strength
+      const routingStrength = clamp(
+        0.75 * saturatingScore(firstPartyCollectorPOSTs.length, 2.5) +
+          (trackingHosts.size > 0 ? 15 : 0),
+      );
+
+      // combine like Stape: overall feels high if analytics/ads/cookieLifetime are strong even if pageSpeed is meh
+      let score =
+        0.3 * analytics +
+        0.3 * ads +
+        0.2 * cookieLifetime +
+        0.15 * pageSpeed +
+        0.05 * routingStrength;
+
+      score -= hygienePenalty;
+      score -= thirdPartyPenalty;
+
+      return clamp(Math.round(score), 0, 100);
+    })();
+
+    const report: StapeLikeReport = {
+      scores: {
+        overall,
+        analytics: Math.round(analytics),
+        ads: Math.round(ads),
+        cookieLifetime: Math.round(cookieLifetime),
+        pageSpeed: Math.round(pageSpeed),
       },
       cookies: {
         total: browserCookies.length,
         firstParty: firstPartyCookies.length,
         thirdParty: thirdPartyCookies.length,
-        insecure: insecureCookies.length,
         serverSet: serverSetCookies.length,
-
-        // broad “server-set by any first-party host”
-        firstPartyServerSet: firstPartyServerCookies.length,
-
-        // ✅ key signal
-        firstPartyTrackingSubdomainServerSet:
-          firstPartyTrackingSubdomainCookies.length,
-
-        // old compact summary (kept)
-        byPlatform: cookiesByPlatform,
-
-        // richer breakdown
-        byPlatformDetailed: cookiesByPlatformDetailed,
+        insecure: insecureCookies.length,
+        trackingCookies: dedupedTrackingCookieRows.sort((a, b) =>
+          a.provider > b.provider ? 1 : -1,
+        ),
       },
-      // endpoints,
-      scores,
-      scoreDrivers: {
-        overallScore,
-        routingStrength,
-        identifierContinuity,
-        cookieQuality,
-        thirdPartyReliance,
-
-        firstPartyCollectorHostsCount: firstPartyCollectorHosts.size,
+      trackers: {
+        detected: trackersDetected.sort((a, b) =>
+          a.platform > b.platform ? 1 : -1,
+        ),
+        totalDetected: trackersDetected.length,
+      },
+      performance: {
+        loadTimeMS,
+        transferSizeKB: Math.round((await page.content()).length / 1024),
+      },
+      debug: {
+        baseDomain,
+        trackingHosts: Array.from(trackingHosts),
+        trackingFirstPartySubdomainHosts: Array.from(
+          trackingFirstPartySubdomainHosts,
+        ),
         firstPartyCollectorPOSTs: firstPartyCollectorPOSTs.length,
-        fpCollectorIdKeyCount,
-        fpCollectorIdHits,
-
-        fpServerSetCookies,
-        fpTrackingServerSetCookies,
-
-        hasFirstPartyCookies: firstPartyCookies.length > 0,
-        hasTrackingSubdomainServerSetCookies:
-          firstPartyTrackingSubdomainCookies.length > 0,
-
-        insecureCookieRatio: insecureRatio,
-        thirdPartyShare,
-        cookieHealthScore,
-      },
-      insights: {
-        diagnosis:
-          routingStrength >= 60
-            ? "First-party routed collection detected"
-            : "Mostly client-side / third-party collection",
-        opportunity:
-          routingStrength >= 70
-            ? "Strong foundation; minor improvements possible"
-            : "Significant opportunity to implement first-party routing + cookie hardening",
-        notes: `${insecureCookies.length} cookies lack Secure or SameSite flags.`,
+        fpCollectorIdKeys: Array.from(fpCollectorIdKeys),
+        requestCounts: {
+          total: requestRecords.length,
+          thirdParty: requestRecords.filter((r) => r.group === "thirdParty")
+            .length,
+          firstParty: requestRecords.filter((r) => r.group !== "thirdParty")
+            .length,
+        },
       },
     };
 
-    return result;
+    return report;
   } finally {
     await browser.close().catch(() => {});
   }

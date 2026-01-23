@@ -620,9 +620,26 @@ export async function runAudit(targetUrl: string) {
       (c) => !normalizeHostname(c.domain).endsWith(baseDomain),
     );
 
-    const insecureCookies = browserCookies.filter(
-      (c) => c.sameSite === "None" || !c.secure,
-    );
+    const isHttps = (() => {
+      try {
+        return new URL(targetUrl).protocol === "https:";
+      } catch {
+        return false;
+      }
+    })();
+
+    const insecureCookies = browserCookies.filter((c) => {
+      const sameSite = String(c.sameSite ?? "");
+      const secure = Boolean(c.secure);
+
+      // If the site is HTTPS, cookies should generally be Secure
+      if (isHttps && !secure) return true;
+
+      // SameSite=None MUST be Secure, or browsers reject / downgrade it
+      if (sameSite === "None" && !secure) return true;
+
+      return false;
+    });
 
     const serverSetCookies = browserCookies.filter((c) => c.setByServer);
 

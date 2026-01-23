@@ -11,12 +11,13 @@ import { parse as parseTld } from "tldts";
  * Goal:
  * - Produce a Stape-like report:
  *   - scores: overall, analytics, ads, cookieLifetime, pageSpeed
+ *   - platform breakdown: per-platform score + signal + method
  *   - cookie table: (cookie name, provider, category, dataSentTo, lifetimeDays)
  *   - trackers detected: platform, category, dataSentTo, trackingMethod, status
  *
  * Notes:
- * - This is still a best-effort scanner (no consent click-through, no ad-click simulation by default).
- * - If you want closer parity, run a second navigation with synthetic click IDs (see RUN_ATTRIBUTION_SIMULATION).
+ * - Best-effort scanner (no consent click-through).
+ * - Optional second navigation with synthetic click IDs for closer parity.
  */
 
 // -----------------------------
@@ -64,7 +65,6 @@ type RequestRecord = {
 };
 
 type CookieParty = "firstParty" | "thirdParty";
-type SetterGroup = "root" | "subdomain" | "thirdParty" | "unknown";
 
 type Platform =
   | "Meta"
@@ -75,6 +75,7 @@ type Platform =
   | "Pinterest"
   | "Microsoft Ads"
   | "Other";
+
 type Category = "Advertising" | "Analytics" | "Essential" | "Other";
 
 type TrackingMethod = "Client-side" | "Server-side" | "Client & Server-side";
@@ -112,8 +113,31 @@ type ScoreBlock = {
   pageSpeed: number; // 0-100
 };
 
+type PlatformSignal = "Strong" | "Improve" | "Weak" | "Not supported";
+
+type PlatformBreakdownRow = {
+  score: number; // 0-100
+  signal: PlatformSignal;
+  firstParty: boolean;
+  serverSide: boolean;
+  trackingMethod: TrackingMethod;
+  notes?: string;
+};
+
+type PlatformsBlock = Record<
+  | "googleAds"
+  | "meta"
+  | "ga4"
+  | "klaviyo"
+  | "pinterest"
+  | "tiktok"
+  | "microsoftAds",
+  PlatformBreakdownRow
+>;
+
 type StapeLikeReport = {
   scores: ScoreBlock;
+  platforms: PlatformsBlock;
   cookies: {
     total: number;
     firstParty: number;
@@ -130,7 +154,7 @@ type StapeLikeReport = {
     loadTimeMS: number;
     transferSizeKB: number;
   };
-  debug: any; // keep your existing deep metrics here if you want
+  debug: any; // keep your deep metrics here if you want
 };
 
 // -----------------------------
@@ -358,20 +382,17 @@ function hostLooksLikeTracking(stat: HostStats): boolean {
 
 // -----------------------------
 // Cookie Catalog (dictionary)
-// This is what makes you "Stape-like".
 // -----------------------------
 type CookieCatalogEntry = {
   provider: Platform;
   category: Category;
   dataSentTo: string; // "US" default
-  // match either exact or regex
   match: (cookieName: string) => boolean;
-  // optional preferred lifetime in days if you want a fallback
   defaultLifetimeDays?: number;
 };
 
 const COOKIE_CATALOG: CookieCatalogEntry[] = [
-  // --- Meta
+  // Meta
   {
     provider: "Meta",
     category: "Advertising",
@@ -387,7 +408,7 @@ const COOKIE_CATALOG: CookieCatalogEntry[] = [
     defaultLifetimeDays: 90,
   },
 
-  // --- GA4 / Google Analytics
+  // GA4 / Google Analytics
   {
     provider: "Google Analytics 4",
     category: "Analytics",
@@ -410,7 +431,7 @@ const COOKIE_CATALOG: CookieCatalogEntry[] = [
     defaultLifetimeDays: 365,
   },
 
-  // --- Google Ads (common attribution cookies)
+  // Google Ads
   {
     provider: "Google Ads",
     category: "Advertising",
@@ -431,7 +452,7 @@ const COOKIE_CATALOG: CookieCatalogEntry[] = [
     dataSentTo: "US",
     match: (n) => n === "_gcl_au",
     defaultLifetimeDays: 90,
-  }, // often 90
+  },
   {
     provider: "Google Ads",
     category: "Advertising",
@@ -454,7 +475,7 @@ const COOKIE_CATALOG: CookieCatalogEntry[] = [
     defaultLifetimeDays: 365,
   },
 
-  // --- Klaviyo
+  // Klaviyo
   {
     provider: "Klaviyo",
     category: "Advertising",
@@ -463,7 +484,7 @@ const COOKIE_CATALOG: CookieCatalogEntry[] = [
     defaultLifetimeDays: 400,
   },
 
-  // --- Pinterest
+  // Pinterest
   {
     provider: "Pinterest",
     category: "Advertising",
@@ -472,7 +493,7 @@ const COOKIE_CATALOG: CookieCatalogEntry[] = [
     defaultLifetimeDays: 365,
   },
 
-  // --- TikTok (basic)
+  // TikTok
   {
     provider: "TikTok",
     category: "Advertising",
@@ -488,7 +509,7 @@ const COOKIE_CATALOG: CookieCatalogEntry[] = [
     defaultLifetimeDays: 30,
   },
 
-  // --- Microsoft Ads (basic)
+  // Microsoft Ads
   {
     provider: "Microsoft Ads",
     category: "Advertising",
@@ -505,14 +526,16 @@ const COOKIE_CATALOG: CookieCatalogEntry[] = [
   },
 ];
 
-// request-domain evidence for tracker detection
+// -----------------------------
+// Tracker catalog (request-domain evidence)
+// -----------------------------
 type TrackerCatalogEntry = {
   platform: Platform;
   category: Category;
   dataSentTo: string;
   requestHostPatterns: RegExp[];
   supportsServerSide: boolean;
-  cookieMatchProviders: Platform[]; // which providers in cookie table map to this tracker
+  cookieMatchProviders: Platform[];
 };
 
 const TRACKER_CATALOG: TrackerCatalogEntry[] = [
@@ -586,7 +609,7 @@ const TRACKER_CATALOG: TrackerCatalogEntry[] = [
     category: "Advertising",
     dataSentTo: "US",
     requestHostPatterns: [/bing\.com/i, /bat\.bing\.com/i],
-    supportsServerSide: false, // matches your screenshot language ("not supported")
+    supportsServerSide: false,
     cookieMatchProviders: ["Microsoft Ads"],
   },
 ];
@@ -594,14 +617,10 @@ const TRACKER_CATALOG: TrackerCatalogEntry[] = [
 // -----------------------------
 // Main
 // -----------------------------
-
-// Optional: run second navigation with synthetic click IDs (closer to Stape).
-// Set to true if you want to try to force creation of _fbc, _gcl_aw/_gcl_gb, etc.
 const RUN_ATTRIBUTION_SIMULATION = true;
 
 function withSyntheticClickIds(urlStr: string) {
   const u = new URL(urlStr);
-  // only add if not present
   if (!u.searchParams.has("gclid")) u.searchParams.set("gclid", "TEST_GCLID");
   if (!u.searchParams.has("gbraid"))
     u.searchParams.set("gbraid", "TEST_GBRAID");
@@ -781,9 +800,11 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       });
       await page
         .waitForLoadState("networkidle", { timeout: 15000 })
-        .catch(() => {});
+        .catch(() => {
+          /* ignore */
+        });
     } catch {
-      // ignore
+      /* ignore */
     }
     const loadTimeMS = Date.now() - start;
 
@@ -792,7 +813,9 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       await page.waitForTimeout(1500);
       await page.mouse.wheel(0, 1200);
       await page.waitForTimeout(1500);
-    } catch {}
+    } catch {
+      /* ignore */
+    }
 
     // ---- Optional navigation pass #2 (synthetic click IDs)
     if (RUN_ATTRIBUTION_SIMULATION) {
@@ -804,9 +827,13 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
         });
         await page
           .waitForLoadState("networkidle", { timeout: 15000 })
-          .catch(() => {});
+          .catch(() => {
+            /* ignore */
+          });
         await page.waitForTimeout(1500);
-      } catch {}
+      } catch {
+        /* ignore */
+      }
     }
 
     // ---- collect cookies
@@ -899,7 +926,6 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       return null;
     }
 
-    // build rows only for catalog cookies we saw
     const trackingCookieRows: ReportCookieRow[] = [];
     for (const c of browserCookies) {
       const entry = catalogMatch(c.name);
@@ -908,6 +934,7 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       const party: CookieParty = isFirstPartyCookieDomain(c.domain, baseDomain)
         ? "firstParty"
         : "thirdParty";
+
       const setMethod: "server" | "client" = c.setByServer
         ? "server"
         : "client";
@@ -927,7 +954,6 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       });
     }
 
-    // De-dupe rows by cookie name (keep first)
     const seen = new Set<string>();
     const dedupedTrackingCookieRows = trackingCookieRows.filter((r) => {
       if (seen.has(r.name)) return false;
@@ -936,28 +962,24 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
     });
 
     // ---- Determine per-platform tracker detection (cookie + request evidence)
-    const requestHostnames = requestRecords.map((r) =>
-      normalizeHostname(r.hostname),
-    );
     const thirdPartyRequestHostnames = requestRecords
       .filter((r) => r.group === "thirdParty")
       .map((r) => normalizeHostname(r.hostname));
 
     // First-party collector POSTs
-    const firstPartyCollectorHosts = trackingHosts; // first-party routed collectors on your domain/subdomain
+    const firstPartyCollectorHosts = trackingHosts;
     const firstPartyCollectorPOSTs = requestRecords.filter((r) => {
       if (r.group === "thirdParty") return false;
       if (r.method !== "POST") return false;
       return firstPartyCollectorHosts.has(normalizeHostname(r.hostname));
     });
 
-    // Identifier keys on first-party collector posts (for “server-side signal” per platform)
+    // Identifier keys on first-party collector posts
     const fpCollectorIdKeys = new Set<string>();
     for (const r of firstPartyCollectorPOSTs) {
       for (const hit of r.identifierHits ?? []) fpCollectorIdKeys.add(hit.key);
     }
 
-    // Platform-specific identifier keys (very important for “server-side detected” feel)
     const PLATFORM_ID_KEYS: Record<Platform, string[]> = {
       Meta: ["fbclid", "fbp", "fbc"],
       "Google Analytics 4": ["_ga", "cid", "client_id", "clientid"],
@@ -985,7 +1007,6 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       cookiesByProvider[row.provider].push(row.name);
     }
 
-    // request evidence grouped by platform (third-party hosts that match platform patterns)
     function hostsMatching(patterns: RegExp[]): string[] {
       return uniq(
         thirdPartyRequestHostnames.filter((h) =>
@@ -999,16 +1020,11 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       const cookieEvidence = uniq(
         (cookiesByProvider[t.platform] ?? []).filter(Boolean),
       );
-
       const requestEvidence = hostsMatching(t.requestHostPatterns);
 
       const detected = cookieEvidence.length > 0 || requestEvidence.length > 0;
       if (!detected) continue;
 
-      // Determine tracking method:
-      // - Client-side if only third-party network / only client cookies
-      // - Server-side if first-party collector exists AND platform server signal present
-      // - Both if both detected
       const hasClient = requestEvidence.length > 0 || cookieEvidence.length > 0;
       const hasServer =
         firstPartyCollectorPOSTs.length > 0 &&
@@ -1018,16 +1034,11 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       if (hasServer && hasClient) trackingMethod = "Client & Server-side";
       else if (hasServer) trackingMethod = "Server-side";
 
-      // Status:
-      // - if platform doesn't support server-side in your product: show not supported
-      // - else if ads platform and only client-side => Improve
-      // - else All good
       let status: TrackerStatus = "All good";
 
       if (!t.supportsServerSide) {
         status = "Not supported";
       } else {
-        // If it’s an ads tracker and only client-side, call Improve
         const isAds = t.category === "Advertising";
         if (isAds && trackingMethod === "Client-side") status = "Improve";
         if (t.platform === "Klaviyo" && trackingMethod === "Client-side")
@@ -1049,11 +1060,8 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
     }
 
     // -----------------------------
-    // Stape-like score construction
+    // First-party readiness scoring + platform breakdown
     // -----------------------------
-
-    // Page speed score (simple: based on loadTimeMS)
-    // adjust breakpoints to taste; this is roughly “fast/ok/slow”
     const pageSpeed = (() => {
       const ms = loadTimeMS;
       if (ms <= 2000) return 95;
@@ -1064,27 +1072,17 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       return 45;
     })();
 
-    // Cookie lifetime score:
-    // Stape’s “cookie lifetime” looks like a quality score, not just average days.
-    // We:
-    // - reward presence of key attribution cookies
-    // - mildly penalize if key cookies are session/very short
     const cookieLifetime = (() => {
       const keyCookies = dedupedTrackingCookieRows;
-
-      // if none, low
       if (!keyCookies.length) return 35;
 
-      // basic presence score
       let score = 70;
 
-      // reward having multiple long-lived cookies
       const longLived = keyCookies.filter(
         (c) => (c.lifetimeDays ?? 0) >= 90,
       ).length;
       score += Math.min(20, longLived * 5);
 
-      // penalize session/short-lived
       const shortLived = keyCookies.filter(
         (c) => c.lifetimeDays === null || (c.lifetimeDays ?? 0) < 7,
       ).length;
@@ -1093,91 +1091,153 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       return clamp(score, 0, 100);
     })();
 
-    // Analytics score:
-    // presence of GA4 cookies + “server signal” for GA4
+    const firstPartyFoundation = (() => {
+      const fpCookiePresent = firstPartyCookies.length > 0;
+      const serverSetPresent = serverSetCookies.length > 0;
+      const fpCollectorPresent = firstPartyCollectorPOSTs.length > 0;
+
+      const fpSubdomainsCount = trackingFirstPartySubdomainHosts.size;
+
+      const score = clamp(
+        40 +
+          (fpCookiePresent ? 20 : 0) +
+          (serverSetPresent ? 15 : 0) +
+          (fpCollectorPresent ? 15 : 0) +
+          Math.min(10, fpSubdomainsCount * 5),
+        0,
+        100,
+      );
+
+      return Math.round(score);
+    })();
+
+    function makePlatformRow(p: Platform): PlatformBreakdownRow {
+      const tracker = trackersDetected.find((t) => t.platform === p);
+
+      const cookieRows = dedupedTrackingCookieRows.filter(
+        (c) => c.provider === p,
+      );
+      const hasCookies = cookieRows.length > 0;
+      const hasFirstPartyCookies = cookieRows.some(
+        (c) => c.party === "firstParty",
+      );
+
+      const hasServer =
+        firstPartyCollectorPOSTs.length > 0 && platformHasServerSignal(p);
+
+      const trackingMethod: TrackingMethod =
+        tracker?.trackingMethod ??
+        (hasServer && hasCookies
+          ? "Client & Server-side"
+          : hasServer
+            ? "Server-side"
+            : hasCookies
+              ? "Client-side"
+              : "Client-side");
+
+      const supportsServerSide =
+        TRACKER_CATALOG.find((t) => t.platform === p)?.supportsServerSide ??
+        true;
+
+      let score = 25;
+      if (hasCookies) score = 60;
+      if (hasFirstPartyCookies) score += 10;
+      if (hasServer) score += 20;
+
+      const isAdsPlatform = p !== "Google Analytics 4" && p !== "Other";
+      if (isAdsPlatform && !hasServer && supportsServerSide) score -= 10;
+
+      if (!supportsServerSide) score = Math.min(score, 70);
+
+      score = clamp(score, 0, 100);
+
+      let signal: PlatformSignal = "Improve";
+      if (!supportsServerSide) signal = "Not supported";
+      else if (score >= 80 && hasServer) signal = "Strong";
+      else if (score < 60) signal = "Weak";
+
+      const notes = !supportsServerSide
+        ? "Limited server-side support"
+        : isAdsPlatform && !hasServer
+          ? "Client-side only (routing recommended)"
+          : hasServer
+            ? "Server-side signal detected"
+            : undefined;
+
+      return {
+        score: Math.round(score),
+        signal,
+        firstParty: hasFirstPartyCookies,
+        serverSide: hasServer,
+        trackingMethod,
+        notes,
+      };
+    }
+
+    const platforms: PlatformsBlock = {
+      googleAds: makePlatformRow("Google Ads"),
+      meta: makePlatformRow("Meta"),
+      ga4: makePlatformRow("Google Analytics 4"),
+      klaviyo: makePlatformRow("Klaviyo"),
+      pinterest: makePlatformRow("Pinterest"),
+      tiktok: makePlatformRow("TikTok"),
+      microsoftAds: makePlatformRow("Microsoft Ads"),
+    };
+
     const analytics = (() => {
       const gaCookies = dedupedTrackingCookieRows.filter(
         (c) => c.provider === "Google Analytics 4",
       );
-      let score = 40;
+      const hasAnyGA = gaCookies.length > 0;
+      const hasGAFirstParty = gaCookies.some((c) => c.party === "firstParty");
 
-      if (gaCookies.find((c) => c.name === "_ga")) score += 25;
-      if (gaCookies.find((c) => c.name.startsWith("_ga_"))) score += 15;
-      if (gaCookies.find((c) => c.name === "FPID")) score += 15;
+      let score = 0;
+      if (hasAnyGA) score += 50;
+      if (hasGAFirstParty) score += 30;
+      if (platforms.ga4.serverSide) score += 20;
 
-      // server routing signal
-      if (
-        platformHasServerSignal("Google Analytics 4") &&
-        firstPartyCollectorPOSTs.length > 0
-      )
-        score += 15;
-
-      return clamp(score, 0, 100);
+      return clamp(Math.round(score), 0, 100);
     })();
 
-    // Ads score:
-    // treat Meta + Google Ads + Pinterest + TikTok + Klaviyo as "ads ecosystem"
     const ads = (() => {
-      const adsTrackers = trackersDetected.filter(
-        (t) => t.category === "Advertising",
-      );
-      if (!adsTrackers.length) return 35;
+      const google = platforms.googleAds.score;
+      const meta = platforms.meta.score;
+      const microsoft = platforms.microsoftAds.score;
 
-      let score = 55;
+      const othersAvg =
+        (platforms.klaviyo.score +
+          platforms.pinterest.score +
+          platforms.tiktok.score) /
+        3;
 
-      // reward breadth
-      score += Math.min(20, adsTrackers.length * 4);
+      const score =
+        google * 0.4 + meta * 0.3 + microsoft * 0.15 + othersAvg * 0.15;
 
-      // reward server-side methods
-      const serverOrBoth = adsTrackers.filter(
-        (t) =>
-          t.trackingMethod === "Server-side" ||
-          t.trackingMethod === "Client & Server-side",
-      ).length;
-      score += Math.min(25, serverOrBoth * 6);
-
-      // penalize lots of client-only
-      const clientOnly = adsTrackers.filter(
-        (t) => t.trackingMethod === "Client-side",
-      ).length;
-      score -= Math.min(20, clientOnly * 5);
-
-      return clamp(score, 0, 100);
+      return clamp(Math.round(score), 0, 100);
     })();
 
-    // Overall:
     const overall = (() => {
-      // small hygiene penalty
       const insecureRatio = ratio(
         insecureCookies.length,
         browserCookies.length || 1,
       );
-      const hygienePenalty = clamp(insecureRatio * 25, 0, 25);
+      const hygienePenalty = clamp(insecureRatio * 10, 0, 10);
 
-      // third-party reliance penalty
       const totalReq = requestRecords.length || 1;
       const thirdPartyReq = requestRecords.filter(
         (r) => r.group === "thirdParty",
       ).length;
       const thirdPartyPenalty = clamp(
-        ratio(thirdPartyReq, totalReq) * 20,
+        ratio(thirdPartyReq, totalReq) * 10,
         0,
-        20,
+        10,
       );
 
-      // routing strength
-      const routingStrength = clamp(
-        0.75 * saturatingScore(firstPartyCollectorPOSTs.length, 2.5) +
-          (trackingHosts.size > 0 ? 15 : 0),
-      );
-
-      // combine like Stape: overall feels high if analytics/ads/cookieLifetime are strong even if pageSpeed is meh
       let score =
-        0.3 * analytics +
-        0.3 * ads +
-        0.2 * cookieLifetime +
-        0.15 * pageSpeed +
-        0.05 * routingStrength;
+        firstPartyFoundation * 0.45 +
+        ads * 0.3 +
+        analytics * 0.2 +
+        pageSpeed * 0.05;
 
       score -= hygienePenalty;
       score -= thirdPartyPenalty;
@@ -1193,6 +1253,7 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
         cookieLifetime: Math.round(cookieLifetime),
         pageSpeed: Math.round(pageSpeed),
       },
+      platforms,
       cookies: {
         total: browserCookies.length,
         firstParty: firstPartyCookies.length,
@@ -1215,6 +1276,7 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       },
       debug: {
         baseDomain,
+        firstPartyFoundation,
         trackingHosts: Array.from(trackingHosts),
         trackingFirstPartySubdomainHosts: Array.from(
           trackingFirstPartySubdomainHosts,
@@ -1233,6 +1295,8 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
 
     return report;
   } finally {
-    await browser.close().catch(() => {});
+    await browser.close().catch(() => {
+      /* ignore */
+    });
   }
 }

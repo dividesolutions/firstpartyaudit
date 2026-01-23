@@ -315,6 +315,20 @@ function hostLooksLikeTracking(stat: HostStats): boolean {
   );
 }
 
+// ---- Scoring helpers (Stape-style)
+function clamp(n: number, min = 0, max = 100) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function ratio(n: number, d: number) {
+  return d > 0 ? n / d : 0;
+}
+
+// Smooth saturating curve for count signals.
+function saturatingScore(x: number, k = 3) {
+  return clamp((1 - Math.exp(-x / k)) * 100);
+}
+
 export async function runAudit(targetUrl: string) {
   const browser: Browser = await chromium.launch({
     headless: true,
@@ -523,7 +537,6 @@ export async function runAudit(targetUrl: string) {
     cookies.forEach((c) => browserCookies.push(c));
 
     // ---- Correlate browser cookies to server-set cookies (STRONGER matching)
-    // This correlation is what enables "setByServer" to be meaningful.
     browserCookies.forEach((c) => {
       const match = allServerCookies.find((s) => {
         const serverName = s.cookie.split("=")[0];
@@ -568,11 +581,10 @@ export async function runAudit(targetUrl: string) {
       else endpoints.thirdParty[stat.hostname] = stat;
     }
 
-    // ---- Behavior-based “server-side tracking” detection
+    // ---- Behavior-based “first-party routed tracking endpoint” detection
     const trackingFirstPartySubdomains = Object.values(
       endpoints.subdomains,
     ).filter((s) => hostLooksLikeTracking(s));
-
     const trackingRoot = Object.values(endpoints.root).filter((s) =>
       hostLooksLikeTracking(s),
     );
@@ -587,21 +599,19 @@ export async function runAudit(targetUrl: string) {
       trackingFirstPartySubdomains.map((h) => normalizeHostname(h.hostname)),
     );
 
-    // ---- Beacon breakdown based on behavior (not name patterns)
-    let computedServer = 0;
-    let computedClient = 0;
+    // ---- Beacon breakdown (NOTE: these are *browser* requests; treat as “first-party routed” vs “third-party”)
+    let computedFirstPartyRouted = 0;
     let computedThirdParty = 0;
 
     for (const r of requestRecords) {
-      const isThirdParty = r.group === "thirdParty";
-      if (isThirdParty) computedThirdParty++;
-
-      if (trackingHosts.has(r.hostname)) computedServer++;
-      else computedClient++;
+      if (r.group === "thirdParty") {
+        computedThirdParty++;
+        continue;
+      }
+      if (trackingHosts.has(r.hostname)) computedFirstPartyRouted++;
     }
 
     // ---- Cookie metrics
-    // "First-party cookies" = cookie domain ends with baseDomain (broad)
     const firstPartyCookies = browserCookies.filter((c) =>
       normalizeHostname(c.domain).endsWith(baseDomain),
     );
@@ -616,15 +626,11 @@ export async function runAudit(targetUrl: string) {
 
     const serverSetCookies = browserCookies.filter((c) => c.setByServer);
 
-    // ✅ the thing you asked for
-    // "First-party tracking subdomain cookies" =
-    // cookies attributed to a *first-party tracking subdomain* via Set-Cookie correlation.
+    // ✅ First-party tracking subdomain cookies (server-set correlation)
     const firstPartyTrackingSubdomainCookies = browserCookies.filter((c) => {
       const setBy = normalizeHostname(c.setByServer ?? "");
       if (!setBy) return false;
       if (!trackingFirstPartySubdomainHosts.has(setBy)) return false;
-
-      // keep them scoped to your site (usually correct)
       return normalizeHostname(c.domain).endsWith(baseDomain);
     });
 
@@ -639,10 +645,9 @@ export async function runAudit(targetUrl: string) {
       return setBy.length > 0 && firstPartyHostnames.has(setBy);
     });
 
-    // ---- Cookies by platform (improved: scope + setter + security + tracking-subdomain signal)
+    // ---- Cookies by platform (detailed)
     const cookiesByPlatformDetailed: Record<string, PlatformCookieStats> = {};
 
-    // For server-set cookies, classify setter host into root/subdomain/thirdParty
     function classifySetterGroup(
       setByHost: string | undefined | null,
     ): SetterGroup {
@@ -672,7 +677,6 @@ export async function runAudit(targetUrl: string) {
       };
     }
 
-    // Private name count maps for topCookieNames per platform
     const platformNameCounts: Record<string, Record<string, number>> = {};
 
     for (const c of browserCookies) {
@@ -698,7 +702,7 @@ export async function runAudit(targetUrl: string) {
         uniqPush(stats.domains.firstParty, normalizeHostname(c.domain));
       else uniqPush(stats.domains.thirdParty, normalizeHostname(c.domain));
 
-      // Insecure (your definition)
+      // Insecure
       const insecure = c.sameSite === "None" || !c.secure;
       if (insecure) stats.insecure += 1;
 
@@ -710,7 +714,6 @@ export async function runAudit(targetUrl: string) {
         const setterGroup = classifySetterGroup(c.setByServer);
         stats.serverSetterGroup[setterGroup] += 1;
 
-        // Save a few setter hosts for debugging
         const sb = normalizeHostname(c.setByServer);
         if (setterGroup === "root") uniqPush(stats.serverSetByHosts.root, sb);
         else if (setterGroup === "subdomain")
@@ -718,12 +721,10 @@ export async function runAudit(targetUrl: string) {
         else if (setterGroup === "thirdParty")
           uniqPush(stats.serverSetByHosts.thirdParty, sb);
 
-        // firstPartyServerSet: server-set by root/subdomain
         if (setterGroup === "root" || setterGroup === "subdomain") {
           stats.firstPartyServerSet += 1;
         }
 
-        // firstPartyTrackingSubdomainServerSet: server-set by tracking subdomain only
         if (trackingFirstPartySubdomainHosts.has(sb)) {
           stats.firstPartyTrackingSubdomainServerSet += 1;
         }
@@ -737,14 +738,13 @@ export async function runAudit(targetUrl: string) {
         (platformNameCounts[platform][nameKey] ?? 0) + 1;
     }
 
-    // finalize unique + top names
     for (const [platform, stats] of Object.entries(cookiesByPlatformDetailed)) {
       const nameMap = platformNameCounts[platform] ?? {};
       stats.uniqueCookieNames = Object.keys(nameMap).length;
       stats.topCookieNames = topN(nameMap, 6);
     }
 
-    // Keep the old compact shape too (backwards compatible)
+    // compact shape (backwards compatible)
     const cookiesByPlatform: Record<
       string,
       { firstParty: number; thirdParty: number }
@@ -756,69 +756,111 @@ export async function runAudit(targetUrl: string) {
       };
     }
 
-    // ---- Scoring
-    // If your intent is “first-party cookies should mean tracking-subdomain cookies only”,
-    // then this should use firstPartyTrackingSubdomainCookies (not firstPartyServerCookies).
-    const cookieHealthScore =
-      (firstPartyTrackingSubdomainCookies.length /
-        (browserCookies.length || 1)) *
-      100;
+    // -------------------------
+    // Stape-style scoring signals
+    // -------------------------
+    const totalRequests = requestRecords.length || 1;
 
-    const hasFirstPartyServerTracking = trackingHosts.size > 0;
-
-    // ALL SCORING LOGIC
-    let firstPartyBias = 0;
-
-    // broad first-party cookies (site-scoped) are still useful as a foundation
-    if (firstPartyCookies.length > 0) firstPartyBias += 60;
-
-    // but the “real signal” you want:
-    if (firstPartyTrackingSubdomainCookies.length > 0) firstPartyBias += 25;
-
-    // small bonus for multiple tracking-subdomain cookies
-    firstPartyBias += Math.min(
-      15,
-      firstPartyTrackingSubdomainCookies.length * 5,
+    const firstPartyRequests = requestRecords.filter(
+      (r) => r.group !== "thirdParty",
+    );
+    const thirdPartyRequests = requestRecords.filter(
+      (r) => r.group === "thirdParty",
     );
 
-    firstPartyBias = Math.min(100, firstPartyBias);
+    const firstPartyPOSTs = firstPartyRequests.filter(
+      (r) => r.method === "POST",
+    );
 
-    let technical = 0;
+    const firstPartyCollectorHosts = new Set<string>([
+      ...trackingRoot.map((h) => normalizeHostname(h.hostname)),
+      ...trackingFirstPartySubdomains.map((h) => normalizeHostname(h.hostname)),
+    ]);
 
-    // foundational
-    if (firstPartyCookies.length > 0) technical += 30;
+    const firstPartyCollectorPOSTs = firstPartyPOSTs.filter((r) =>
+      firstPartyCollectorHosts.has(normalizeHostname(r.hostname)),
+    );
 
-    // track-subdomain, server-set correlation is stronger than “any server cookie”
-    if (firstPartyTrackingSubdomainCookies.length > 0) technical += 25;
+    const fpCollectorIdHits = firstPartyCollectorPOSTs.reduce((acc, r) => {
+      return acc + (r.identifierHits?.length ?? 0);
+    }, 0);
 
-    // security hygiene
+    const fpCollectorIdKeys = new Set<string>();
+    for (const r of firstPartyCollectorPOSTs) {
+      for (const hit of r.identifierHits ?? []) fpCollectorIdKeys.add(hit.key);
+    }
+    const fpCollectorIdKeyCount = fpCollectorIdKeys.size;
+
+    const thirdPartyShare = ratio(thirdPartyRequests.length, totalRequests);
+
     const insecureRatio =
       browserCookies.length > 0
         ? insecureCookies.length / browserCookies.length
         : 1;
 
-    technical += Math.round((1 - insecureRatio) * 25);
+    const fpServerSetCookies = firstPartyServerCookies.length;
+    const fpTrackingServerSetCookies =
+      firstPartyTrackingSubdomainCookies.length;
 
-    // architecture signal
-    if (hasFirstPartyServerTracking) technical += 20;
+    // ---- Scoring (closer to Stape feel)
+    let routingStrength = 0;
+    routingStrength +=
+      0.75 * saturatingScore(firstPartyCollectorPOSTs.length, 2.5);
+    routingStrength += firstPartyCollectorHosts.size > 0 ? 15 : 0;
+    routingStrength = clamp(routingStrength);
 
-    technical = Math.min(100, technical);
+    let identifierContinuity = 0;
+    identifierContinuity += 0.75 * saturatingScore(fpCollectorIdKeyCount, 2);
+    identifierContinuity += 0.25 * saturatingScore(fpCollectorIdHits, 6);
+    identifierContinuity = clamp(identifierContinuity);
 
-    let potentialWithFirstParty = 95;
+    let cookieQuality = 0;
+    cookieQuality += 0.55 * saturatingScore(fpServerSetCookies, 3);
+    cookieQuality += 0.35 * saturatingScore(fpTrackingServerSetCookies, 2);
+    cookieQuality += 0.1 * clamp((1 - insecureRatio) * 100);
+    cookieQuality = clamp(cookieQuality);
 
-    // if they already have a bunch of tracking-subdomain cookies,
-    // there may be less upside (tweak as you like)
-    if (firstPartyTrackingSubdomainCookies.length > 3)
-      potentialWithFirstParty -= 10;
-    if (browserCookies.length === 0) potentialWithFirstParty -= 20;
+    const thirdPartyReliance = clamp(thirdPartyShare * 100);
 
-    potentialWithFirstParty = Math.max(60, potentialWithFirstParty);
+    let overall =
+      0.4 * routingStrength +
+      0.25 * identifierContinuity +
+      0.2 * cookieQuality +
+      0.15 * (100 - thirdPartyReliance);
+
+    overall = clamp(overall);
+    const overallScore = Math.round(overall);
+
+    let technical =
+      0.5 * cookieQuality +
+      0.35 * routingStrength +
+      0.15 * clamp((1 - insecureRatio) * 100);
+
+    technical = clamp(technical);
+
+    let firstPartyBias =
+      0.55 * routingStrength +
+      0.3 * saturatingScore(fpTrackingServerSetCookies, 2) +
+      0.15 * saturatingScore(fpServerSetCookies, 3);
+
+    firstPartyBias = clamp(firstPartyBias);
+
+    let potentialWithFirstParty = clamp(100 - overall, 0, 100);
+    if (routingStrength > 70) potentialWithFirstParty -= 10;
+    if (routingStrength > 85) potentialWithFirstParty -= 10;
+    potentialWithFirstParty = clamp(potentialWithFirstParty, 35, 95);
 
     const scores = {
-      technical,
-      firstPartyBias,
-      potentialWithFirstParty,
+      technical: Math.round(technical),
+      firstPartyBias: Math.round(firstPartyBias),
+      potentialWithFirstParty: Math.round(potentialWithFirstParty),
     };
+
+    // A small “health” metric you had before (kept, but now just a driver)
+    const cookieHealthScore =
+      (firstPartyTrackingSubdomainCookies.length /
+        (browserCookies.length || 1)) *
+      100;
 
     // ---- Output
     const result = {
@@ -833,13 +875,14 @@ export async function runAudit(targetUrl: string) {
         transferSizeKB: Math.round((await page.content()).length / 1024),
       },
       tracking: {
+        // These are browser requests. Treat “server” as “first-party routed” for UI wording.
         beaconBreakdown: {
-          client: computedClient,
-          server: computedServer,
+          firstPartyRouted: computedFirstPartyRouted,
           thirdParty: computedThirdParty,
           total: requestRecords.length,
         },
-        // serverDomainsDetected: Array.from(trackingHosts),
+        // Optional debug:
+        // trackingHosts: Array.from(trackingHosts),
         // trackingFirstPartySubdomainHosts: Array.from(trackingFirstPartySubdomainHosts),
       },
       cookies: {
@@ -852,36 +895,50 @@ export async function runAudit(targetUrl: string) {
         // broad “server-set by any first-party host”
         firstPartyServerSet: firstPartyServerCookies.length,
 
-        // ✅ the signal you care about
+        // ✅ key signal
         firstPartyTrackingSubdomainServerSet:
           firstPartyTrackingSubdomainCookies.length,
 
         // old compact summary (kept)
         byPlatform: cookiesByPlatform,
 
-        // ✅ NEW richer breakdown
+        // richer breakdown
         byPlatformDetailed: cookiesByPlatformDetailed,
       },
       // endpoints,
       scores,
       scoreDrivers: {
+        overallScore,
+        routingStrength,
+        identifierContinuity,
+        cookieQuality,
+        thirdPartyReliance,
+
+        firstPartyCollectorHostsCount: firstPartyCollectorHosts.size,
+        firstPartyCollectorPOSTs: firstPartyCollectorPOSTs.length,
+        fpCollectorIdKeyCount,
+        fpCollectorIdHits,
+
+        fpServerSetCookies,
+        fpTrackingServerSetCookies,
+
         hasFirstPartyCookies: firstPartyCookies.length > 0,
         hasTrackingSubdomainServerSetCookies:
           firstPartyTrackingSubdomainCookies.length > 0,
-        hasServerSideRouting: hasFirstPartyServerTracking,
+
         insecureCookieRatio: insecureRatio,
-        trackingFirstPartySubdomainHostsCount:
-          trackingFirstPartySubdomainHosts.size,
+        thirdPartyShare,
         cookieHealthScore,
       },
       insights: {
-        diagnosis: hasFirstPartyServerTracking
-          ? "Server-side tracking detected"
-          : "Client-side only tracking",
+        diagnosis:
+          routingStrength >= 60
+            ? "First-party routed collection detected"
+            : "Mostly client-side / third-party collection",
         opportunity:
-          firstPartyTrackingSubdomainCookies.length > 0
+          routingStrength >= 70
             ? "Strong foundation; minor improvements possible"
-            : "Significant opportunity to implement first-party tracking",
+            : "Significant opportunity to implement first-party routing + cookie hardening",
         notes: `${insecureCookies.length} cookies lack Secure or SameSite flags.`,
       },
     };

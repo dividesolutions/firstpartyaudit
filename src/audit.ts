@@ -251,10 +251,6 @@ function ratio(n: number, d: number) {
   return d > 0 ? n / d : 0;
 }
 
-function saturatingScore(x: number, k = 3) {
-  return clamp((1 - Math.exp(-x / k)) * 100);
-}
-
 function uniq<T>(arr: T[]): T[] {
   return [...new Set(arr)];
 }
@@ -888,7 +884,7 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       trackingFirstPartySubdomains.map((h) => normalizeHostname(h.hostname)),
     );
 
-    // ---- Cookie party & server set counts
+    // ---- Cookie party & server set counts (ALL cookies)
     const firstPartyCookies = browserCookies.filter((c) =>
       normalizeHostname(c.domain).endsWith(baseDomain),
     );
@@ -917,7 +913,7 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       return false;
     });
 
-    // ---- Curate "tracking cookies" like Stape does
+    // ---- Curate "tracking cookies" like Stape does (catalog matched only)
     function catalogMatch(name: string): CookieCatalogEntry | null {
       const n = String(name || "").trim();
       for (const entry of COOKIE_CATALOG) {
@@ -960,6 +956,15 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       seen.add(r.name);
       return true;
     });
+
+    // ---- Tracking cookie breakdown (used for scoring)
+    const trackingCookies = dedupedTrackingCookieRows;
+    const fpTrackingCookies = trackingCookies.filter(
+      (c) => c.party === "firstParty",
+    );
+    const tpTrackingCookies = trackingCookies.filter(
+      (c) => c.party === "thirdParty",
+    );
 
     // ---- Determine per-platform tracker detection (cookie + request evidence)
     const thirdPartyRequestHostnames = requestRecords
@@ -1060,7 +1065,7 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
     }
 
     // -----------------------------
-    // First-party readiness scoring + platform breakdown
+    // Scoring
     // -----------------------------
     const pageSpeed = (() => {
       const ms = loadTimeMS;
@@ -1091,24 +1096,41 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       return clamp(score, 0, 100);
     })();
 
-    const firstPartyFoundation = (() => {
-      const fpCookiePresent = firstPartyCookies.length > 0;
-      const serverSetPresent = serverSetCookies.length > 0;
-      const fpCollectorPresent = firstPartyCollectorPOSTs.length > 0;
+    // ---- Cookie-dominant score (0–100), based on *catalog-matched tracking cookies*
+    const cookieScore = (() => {
+      if (!trackingCookies.length) return 0;
 
-      const fpSubdomainsCount = trackingFirstPartySubdomainHosts.size;
+      const fpRatio = ratio(fpTrackingCookies.length, trackingCookies.length);
+      const tpRatio = ratio(tpTrackingCookies.length, trackingCookies.length);
 
-      const score = clamp(
-        40 +
-          (fpCookiePresent ? 20 : 0) +
-          (serverSetPresent ? 15 : 0) +
-          (fpCollectorPresent ? 15 : 0) +
-          Math.min(10, fpSubdomainsCount * 5),
-        0,
-        100,
+      const insecureRatio = ratio(
+        insecureCookies.length,
+        browserCookies.length || 1,
       );
 
-      return Math.round(score);
+      const shortOrUnknown = trackingCookies.filter(
+        (c) => c.lifetimeDays === null || (c.lifetimeDays ?? 0) < 7,
+      ).length;
+      const shortRatio = ratio(shortOrUnknown, trackingCookies.length || 1);
+
+      let score = 0;
+
+      // First-party ownership is the main driver
+      score += fpRatio * 70;
+
+      // Third-party dependence hurts
+      score -= tpRatio * 35;
+
+      // Cookie hygiene
+      score -= clamp(insecureRatio * 20, 0, 20);
+
+      // Broken / session / too-short lifetimes among tracking cookies
+      score -= clamp(shortRatio * 15, 0, 15);
+
+      // Small bonus for having multiple FP tracking cookies (saturates fast)
+      score += Math.min(10, fpTrackingCookies.length * 2);
+
+      return clamp(Math.round(score), 0, 100);
     })();
 
     function makePlatformRow(p: Platform): PlatformBreakdownRow {
@@ -1216,34 +1238,18 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       return clamp(Math.round(score), 0, 100);
     })();
 
-    const overall = (() => {
-      const insecureRatio = ratio(
-        insecureCookies.length,
-        browserCookies.length || 1,
-      );
-      const hygienePenalty = clamp(insecureRatio * 10, 0, 10);
+    // ---- Overall score: 90% cookies, 10% pageSpeed
+    let overall = clamp(
+      Math.round(cookieScore * 0.9 + pageSpeed * 0.1),
+      0,
+      100,
+    );
 
-      const totalReq = requestRecords.length || 1;
-      const thirdPartyReq = requestRecords.filter(
-        (r) => r.group === "thirdParty",
-      ).length;
-      const thirdPartyPenalty = clamp(
-        ratio(thirdPartyReq, totalReq) * 10,
-        0,
-        10,
-      );
-
-      let score =
-        firstPartyFoundation * 0.45 +
-        ads * 0.3 +
-        analytics * 0.2 +
-        pageSpeed * 0.05;
-
-      score -= hygienePenalty;
-      score -= thirdPartyPenalty;
-
-      return clamp(Math.round(score), 0, 100);
-    })();
+    // Hard rule: if there are NO first-party *tracking* cookies (catalog-matched),
+    // the site cannot score above 50.
+    if (fpTrackingCookies.length === 0) {
+      overall = Math.min(overall, 50);
+    }
 
     const report: StapeLikeReport = {
       scores: {
@@ -1276,13 +1282,19 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       },
       debug: {
         baseDomain,
-        firstPartyFoundation,
+
+        // scoring internals
+        cookieScore,
+        fpTrackingCookieCount: fpTrackingCookies.length,
+        tpTrackingCookieCount: tpTrackingCookies.length,
+
         trackingHosts: Array.from(trackingHosts),
         trackingFirstPartySubdomainHosts: Array.from(
           trackingFirstPartySubdomainHosts,
         ),
         firstPartyCollectorPOSTs: firstPartyCollectorPOSTs.length,
         fpCollectorIdKeys: Array.from(fpCollectorIdKeys),
+
         requestCounts: {
           total: requestRecords.length,
           thirdParty: requestRecords.filter((r) => r.group === "thirdParty")

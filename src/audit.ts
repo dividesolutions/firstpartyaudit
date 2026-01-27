@@ -8,16 +8,14 @@ import {
 import { parse as parseTld } from "tldts";
 
 /**
- * Goal:
- * - Produce a Stape-like report:
- *   - scores: overall, analytics, ads, cookieLifetime, pageSpeed
- *   - platform breakdown: per-platform score + signal + method
- *   - cookie table: (cookie name, provider, category, dataSentTo, lifetimeDays)
- *   - trackers detected: platform, category, dataSentTo, trackingMethod, status
+ * First Party Audit — tracking-focused scanner
  *
- * Notes:
- * - Best-effort scanner (no consent click-through).
- * - Optional second navigation with synthetic click IDs for closer parity.
+ * Purpose:
+ * - Only "care" about cookies that are associated with tracking (catalog-matched)
+ * - Measure first-party vs third-party *tracking* cookies for ad/analytics platforms
+ * - Detect first-party routed collectors (server-side / first-party routing signal)
+ * - Produce a Stape-like report where client-facing cookie metrics & scores move only
+ *   when tracking implementation changes.
  */
 
 // -----------------------------
@@ -90,6 +88,12 @@ type ReportCookieRow = {
   party: CookieParty;
   setMethod: "server" | "client";
   domain: string;
+
+  // tracking-focused hygiene flags
+  secure: boolean;
+  sameSite: string | null;
+  httpOnly: boolean;
+  insecure: boolean; // defined below, only evaluated for tracking cookies
 };
 
 type TrackerRow = {
@@ -138,23 +142,32 @@ type PlatformsBlock = Record<
 type StapeLikeReport = {
   scores: ScoreBlock;
   platforms: PlatformsBlock;
+
+  /**
+   * IMPORTANT:
+   * - These counts are tracking-only (catalog matched).
+   * - Non-tracking cookies do NOT affect client-facing metrics or scoring.
+   */
   cookies: {
-    total: number;
-    firstParty: number;
-    thirdParty: number;
-    serverSet: number;
-    insecure: number; // hygiene (realistic definition)
-    trackingCookies: ReportCookieRow[]; // curated table rows
+    total: number; // total tracking cookies (deduped)
+    firstParty: number; // first-party tracking cookies
+    thirdParty: number; // third-party tracking cookies
+    serverSet: number; // server-set tracking cookies
+    insecure: number; // insecure tracking cookies (tracking-only hygiene)
+    trackingCookies: ReportCookieRow[]; // curated table rows (tracking-only)
   };
+
   trackers: {
     detected: TrackerRow[];
     totalDetected: number;
   };
+
   performance: {
     loadTimeMS: number;
     transferSizeKB: number;
   };
-  debug: any; // keep your deep metrics here if you want
+
+  debug: any; // raw counters, includes non-tracking data
 };
 
 // -----------------------------
@@ -264,6 +277,14 @@ function daysFromCookieExpires(
   const diff = expires - now;
   if (diff <= 0) return 0;
   return Math.round(diff / (60 * 60 * 24));
+}
+
+function isHttpsUrl(url: string): boolean {
+  try {
+    return new URL(url).protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 // -----------------------------
@@ -377,7 +398,7 @@ function hostLooksLikeTracking(stat: HostStats): boolean {
 }
 
 // -----------------------------
-// Cookie Catalog (dictionary)
+// Cookie Catalog (dictionary) — this is what we "care" about
 // -----------------------------
 type CookieCatalogEntry = {
   provider: Platform;
@@ -631,6 +652,32 @@ function withSyntheticClickIds(urlStr: string) {
   return u.toString();
 }
 
+function catalogMatch(cookieName: string): CookieCatalogEntry | null {
+  const n = String(cookieName || "").trim();
+  for (const entry of COOKIE_CATALOG) {
+    if (entry.match(n)) return entry;
+  }
+  return null;
+}
+
+/**
+ * Tracking-focused insecurity:
+ * - If site is HTTPS and cookie is not Secure => insecure
+ * - If SameSite=None and cookie is not Secure => insecure
+ *
+ * (We only compute this for tracking cookies.)
+ */
+function isTrackingCookieInsecure(opts: {
+  isHttps: boolean;
+  secure: boolean;
+  sameSite: string | null;
+}): boolean {
+  const { isHttps, secure, sameSite } = opts;
+  if (isHttps && !secure) return true;
+  if ((sameSite ?? "") === "None" && !secure) return true;
+  return false;
+}
+
 export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
   const browser: Browser = await chromium.launch({
     headless: true,
@@ -642,17 +689,19 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
     const page = await context.newPage();
 
     const baseDomain = getRegistrableDomain(targetUrl);
+    const isHttps = isHttpsUrl(targetUrl);
 
     const requestRecords: RequestRecord[] = [];
     const hosts = new Map<string, HostStats>();
     const reqToIndex = new Map<Request, number>();
 
     const allServerCookies: Array<{
-      cookie: string;
+      cookie: string; // "name=value"
       domain: string;
       setBy: string;
       source: "server-set";
     }> = [];
+
     const browserCookies: any[] = [];
 
     // ---- Request listener
@@ -723,63 +772,60 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
         const setCookieHeader =
           (headers as any)["set-cookie"] ?? (headers as any)["Set-Cookie"];
 
-        if (setCookieHeader) {
-          const rawCookieLines = Array.isArray(setCookieHeader)
-            ? setCookieHeader.flatMap((v: string) => splitSetCookie(v))
-            : splitSetCookie(setCookieHeader);
+        if (!setCookieHeader) return;
 
-          const cookieNamesForThisResponse: string[] = [];
+        const rawCookieLines = Array.isArray(setCookieHeader)
+          ? setCookieHeader.flatMap((v: string) => splitSetCookie(v))
+          : splitSetCookie(setCookieHeader);
 
-          rawCookieLines.forEach((line) => {
-            const name = extractCookieName(line);
-            if (name) cookieNamesForThisResponse.push(name);
+        const cookieNamesForThisResponse: string[] = [];
 
-            const cookieDomain = extractCookieDomainFromSetCookie(
-              line,
-              hostname,
-            );
+        rawCookieLines.forEach((line) => {
+          const name = extractCookieName(line);
+          if (name) cookieNamesForThisResponse.push(name);
 
-            allServerCookies.push({
-              cookie: (line.split(";")[0] ?? "").trim(),
-              domain: cookieDomain,
-              setBy: hostname,
-              source: "server-set",
-            });
+          const cookieDomain = extractCookieDomainFromSetCookie(line, hostname);
+
+          allServerCookies.push({
+            cookie: (line.split(";")[0] ?? "").trim(),
+            domain: cookieDomain,
+            setBy: hostname,
+            source: "server-set",
           });
+        });
 
-          const stat = getOrInitHostStats(hosts, hostname, group);
-          stat.setCookieResponses += 1;
-          stat.setCookieCount += cookieNamesForThisResponse.length;
-          for (const n of cookieNamesForThisResponse) bump(stat.cookieNames, n);
+        const stat = getOrInitHostStats(hosts, hostname, group);
+        stat.setCookieResponses += 1;
+        stat.setCookieCount += cookieNamesForThisResponse.length;
+        for (const n of cookieNamesForThisResponse) bump(stat.cookieNames, n);
 
-          if (record) {
-            record.setCookieNames = cookieNamesForThisResponse;
-            record.setCookieCount = cookieNamesForThisResponse.length;
+        if (!record) return;
 
-            const extraHits = scanForIdentifiers({
-              url: new URL(record.url),
-              method: record.method,
-              headers: req.headers(),
-              postData: req.postData(),
-              cookieNamesFromResponse: cookieNamesForThisResponse,
-            });
+        record.setCookieNames = cookieNamesForThisResponse;
+        record.setCookieCount = cookieNamesForThisResponse.length;
 
-            const merged = new Map<string, IdentifierHit>();
-            for (const h of record.identifierHits ?? [])
-              merged.set(`${h.key}:${h.where}`, h);
-            for (const h of extraHits) merged.set(`${h.key}:${h.where}`, h);
-            record.identifierHits = [...merged.values()];
+        const extraHits = scanForIdentifiers({
+          url: new URL(record.url),
+          method: record.method,
+          headers: req.headers(),
+          postData: req.postData(),
+          cookieNamesFromResponse: cookieNamesForThisResponse,
+        });
 
-            // rebuild per-host identifier counts
-            stat.identifierHits = 0;
-            stat.identifierKeys = {};
-            for (const r of requestRecords) {
-              if (normalizeHostname(r.hostname) !== stat.hostname) continue;
-              for (const hit of r.identifierHits ?? []) {
-                stat.identifierHits += 1;
-                bump(stat.identifierKeys, hit.key);
-              }
-            }
+        const merged = new Map<string, IdentifierHit>();
+        for (const h of record.identifierHits ?? [])
+          merged.set(`${h.key}:${h.where}`, h);
+        for (const h of extraHits) merged.set(`${h.key}:${h.where}`, h);
+        record.identifierHits = [...merged.values()];
+
+        // rebuild per-host identifier counts
+        stat.identifierHits = 0;
+        stat.identifierKeys = {};
+        for (const r of requestRecords) {
+          if (normalizeHostname(r.hostname) !== stat.hostname) continue;
+          for (const hit of r.identifierHits ?? []) {
+            stat.identifierHits += 1;
+            bump(stat.identifierKeys, hit.key);
           }
         }
       } catch {
@@ -832,7 +878,7 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       }
     }
 
-    // ---- collect cookies
+    // ---- collect cookies (raw input)
     const cookies = await context.cookies();
     cookies.forEach((c) => browserCookies.push(c));
 
@@ -884,99 +930,11 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       trackingFirstPartySubdomains.map((h) => normalizeHostname(h.hostname)),
     );
 
-    // ---- Cookie party & server set counts (ALL cookies)
-    const firstPartyCookies = browserCookies.filter((c) =>
-      normalizeHostname(c.domain).endsWith(baseDomain),
-    );
-    const thirdPartyCookies = browserCookies.filter(
-      (c) => !normalizeHostname(c.domain).endsWith(baseDomain),
-    );
-    const serverSetCookies = browserCookies.filter((c) =>
-      Boolean(c.setByServer),
-    );
-
-    // ---- "insecure" (realistic definition)
-    const isHttps = (() => {
-      try {
-        return new URL(targetUrl).protocol === "https:";
-      } catch {
-        return false;
-      }
-    })();
-
-    // insecure = missing Secure on https OR SameSite=None without Secure
-    const insecureCookies = browserCookies.filter((c) => {
-      const secure = Boolean(c.secure);
-      const sameSite = String(c.sameSite ?? "");
-      if (isHttps && !secure) return true;
-      if (sameSite === "None" && !secure) return true;
-      return false;
-    });
-
-    // ---- Curate "tracking cookies" like Stape does (catalog matched only)
-    function catalogMatch(name: string): CookieCatalogEntry | null {
-      const n = String(name || "").trim();
-      for (const entry of COOKIE_CATALOG) {
-        if (entry.match(n)) return entry;
-      }
-      return null;
-    }
-
-    const trackingCookieRows: ReportCookieRow[] = [];
-    for (const c of browserCookies) {
-      const entry = catalogMatch(c.name);
-      if (!entry) continue;
-
-      const party: CookieParty = isFirstPartyCookieDomain(c.domain, baseDomain)
-        ? "firstParty"
-        : "thirdParty";
-
-      const setMethod: "server" | "client" = c.setByServer
-        ? "server"
-        : "client";
-
-      const lifetime = daysFromCookieExpires(c.expires);
-      const lifetimeDays = lifetime ?? entry.defaultLifetimeDays ?? null;
-
-      trackingCookieRows.push({
-        name: c.name,
-        provider: entry.provider,
-        category: entry.category,
-        dataSentTo: entry.dataSentTo,
-        lifetimeDays,
-        party,
-        setMethod,
-        domain: String(c.domain ?? ""),
-      });
-    }
-
-    const seen = new Set<string>();
-    const dedupedTrackingCookieRows = trackingCookieRows.filter((r) => {
-      if (seen.has(r.name)) return false;
-      seen.add(r.name);
-      return true;
-    });
-
-    // ---- Tracking cookie breakdown (used for scoring)
-    const trackingCookies = dedupedTrackingCookieRows;
-    const fpTrackingCookies = trackingCookies.filter(
-      (c) => c.party === "firstParty",
-    );
-    const tpTrackingCookies = trackingCookies.filter(
-      (c) => c.party === "thirdParty",
-    );
-
-    // ---- Determine per-platform tracker detection (cookie + request evidence)
-    const thirdPartyRequestHostnames = requestRecords
-      .filter((r) => r.group === "thirdParty")
-      .map((r) => normalizeHostname(r.hostname));
-
-    // First-party collector POSTs
-    const firstPartyCollectorHosts = trackingHosts;
+    // ---- First-party collector POSTs
     const firstPartyCollectorPOSTs = requestRecords.filter((r) => {
       if (r.group === "thirdParty") return false;
       if (r.method !== "POST") return false;
-      return firstPartyCollectorHosts.has(normalizeHostname(r.hostname));
+      return trackingHosts.has(normalizeHostname(r.hostname));
     });
 
     // Identifier keys on first-party collector posts
@@ -1005,9 +963,86 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       return false;
     }
 
-    // cookie evidence grouped by platform
+    // -----------------------------
+    // TRACKING-ONLY cookies (catalog matched)
+    // -----------------------------
+    const trackingCookieRowsRaw: ReportCookieRow[] = [];
+
+    for (const c of browserCookies) {
+      const entry = catalogMatch(c.name);
+      if (!entry) continue;
+
+      const party: CookieParty = isFirstPartyCookieDomain(c.domain, baseDomain)
+        ? "firstParty"
+        : "thirdParty";
+
+      const setMethod: "server" | "client" = c.setByServer
+        ? "server"
+        : "client";
+
+      const lifetime = daysFromCookieExpires(c.expires);
+      const lifetimeDays = lifetime ?? entry.defaultLifetimeDays ?? null;
+
+      const secure = Boolean(c.secure);
+      const sameSite =
+        c.sameSite === undefined || c.sameSite === null
+          ? null
+          : String(c.sameSite);
+      const httpOnly = Boolean(c.httpOnly);
+
+      const insecure = isTrackingCookieInsecure({
+        isHttps,
+        secure,
+        sameSite,
+      });
+
+      trackingCookieRowsRaw.push({
+        name: c.name,
+        provider: entry.provider,
+        category: entry.category,
+        dataSentTo: entry.dataSentTo,
+        lifetimeDays,
+        party,
+        setMethod,
+        domain: String(c.domain ?? ""),
+        secure,
+        sameSite,
+        httpOnly,
+        insecure,
+      });
+    }
+
+    // Dedup tracking rows by cookie name (stable metrics for clients)
+    const seen = new Set<string>();
+    const trackingCookies = trackingCookieRowsRaw.filter((r) => {
+      if (seen.has(r.name)) return false;
+      seen.add(r.name);
+      return true;
+    });
+
+    const fpTrackingCookies = trackingCookies.filter(
+      (c) => c.party === "firstParty",
+    );
+    const tpTrackingCookies = trackingCookies.filter(
+      (c) => c.party === "thirdParty",
+    );
+
+    const serverSetTrackingCookies = trackingCookies.filter(
+      (c) => c.setMethod === "server",
+    );
+
+    const insecureTrackingCookies = trackingCookies.filter((c) => c.insecure);
+
+    // -----------------------------
+    // Tracker detection (cookie + request evidence)
+    // -----------------------------
+    const thirdPartyRequestHostnames = requestRecords
+      .filter((r) => r.group === "thirdParty")
+      .map((r) => normalizeHostname(r.hostname));
+
+    // cookie evidence grouped by platform (tracking-only)
     const cookiesByProvider: Record<string, string[]> = {};
-    for (const row of dedupedTrackingCookieRows) {
+    for (const row of trackingCookies) {
       cookiesByProvider[row.provider] = cookiesByProvider[row.provider] ?? [];
       cookiesByProvider[row.provider].push(row.name);
     }
@@ -1065,7 +1100,7 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
     }
 
     // -----------------------------
-    // Scoring
+    // Scoring (tracking-only)
     // -----------------------------
     const pageSpeed = (() => {
       const ms = loadTimeMS;
@@ -1078,17 +1113,16 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
     })();
 
     const cookieLifetime = (() => {
-      const keyCookies = dedupedTrackingCookieRows;
-      if (!keyCookies.length) return 35;
+      if (!trackingCookies.length) return 35;
 
       let score = 70;
 
-      const longLived = keyCookies.filter(
+      const longLived = trackingCookies.filter(
         (c) => (c.lifetimeDays ?? 0) >= 90,
       ).length;
       score += Math.min(20, longLived * 5);
 
-      const shortLived = keyCookies.filter(
+      const shortLived = trackingCookies.filter(
         (c) => c.lifetimeDays === null || (c.lifetimeDays ?? 0) < 7,
       ).length;
       score -= Math.min(25, shortLived * 6);
@@ -1096,7 +1130,12 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       return clamp(score, 0, 100);
     })();
 
-    // ---- Cookie-dominant score (0–100), based on *catalog-matched tracking cookies*
+    /**
+     * Cookie score:
+     * - Dominated by first-party share of tracking cookies
+     * - Only penalizes insecurity for tracking cookies
+     * - Only penalizes short/unknown lifetime for tracking cookies
+     */
     const cookieScore = (() => {
       if (!trackingCookies.length) return 0;
 
@@ -1104,30 +1143,30 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       const tpRatio = ratio(tpTrackingCookies.length, trackingCookies.length);
 
       const insecureRatio = ratio(
-        insecureCookies.length,
-        browserCookies.length || 1,
+        insecureTrackingCookies.length,
+        trackingCookies.length,
       );
 
       const shortOrUnknown = trackingCookies.filter(
         (c) => c.lifetimeDays === null || (c.lifetimeDays ?? 0) < 7,
       ).length;
-      const shortRatio = ratio(shortOrUnknown, trackingCookies.length || 1);
+      const shortRatio = ratio(shortOrUnknown, trackingCookies.length);
 
       let score = 0;
 
-      // First-party ownership is the main driver
-      score += fpRatio * 70;
+      // main driver: first-party tracking coverage
+      score += fpRatio * 75;
 
-      // Third-party dependence hurts
+      // third-party dependency hurts
       score -= tpRatio * 35;
 
-      // Cookie hygiene
-      score -= clamp(insecureRatio * 20, 0, 20);
+      // tracking cookie hygiene (small)
+      score -= clamp(insecureRatio * 10, 0, 10);
 
-      // Broken / session / too-short lifetimes among tracking cookies
+      // short/unknown lifetimes among tracking cookies
       score -= clamp(shortRatio * 15, 0, 15);
 
-      // Small bonus for having multiple FP tracking cookies (saturates fast)
+      // small bonus for multiple FP tracking cookies (saturates fast)
       score += Math.min(10, fpTrackingCookies.length * 2);
 
       return clamp(Math.round(score), 0, 100);
@@ -1136,9 +1175,7 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
     function makePlatformRow(p: Platform): PlatformBreakdownRow {
       const tracker = trackersDetected.find((t) => t.platform === p);
 
-      const cookieRows = dedupedTrackingCookieRows.filter(
-        (c) => c.provider === p,
-      );
+      const cookieRows = trackingCookies.filter((c) => c.provider === p);
       const hasCookies = cookieRows.length > 0;
       const hasFirstPartyCookies = cookieRows.some(
         (c) => c.party === "firstParty",
@@ -1163,7 +1200,7 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
 
       let score = 25;
       if (hasCookies) score = 60;
-      if (hasFirstPartyCookies) score += 10;
+      if (hasFirstPartyCookies) score += 15; // slightly more emphasis (your product)
       if (hasServer) score += 20;
 
       const isAdsPlatform = p !== "Google Analytics 4" && p !== "Other";
@@ -1175,7 +1212,8 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
 
       let signal: PlatformSignal = "Improve";
       if (!supportsServerSide) signal = "Not supported";
-      else if (score >= 80 && hasServer) signal = "Strong";
+      else if (score >= 80 && (hasServer || hasFirstPartyCookies))
+        signal = "Strong";
       else if (score < 60) signal = "Weak";
 
       const notes = !supportsServerSide
@@ -1184,7 +1222,9 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
           ? "Client-side only (routing recommended)"
           : hasServer
             ? "Server-side signal detected"
-            : undefined;
+            : hasFirstPartyCookies
+              ? "First-party tracking cookie present"
+              : undefined;
 
       return {
         score: Math.round(score),
@@ -1207,7 +1247,7 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
     };
 
     const analytics = (() => {
-      const gaCookies = dedupedTrackingCookieRows.filter(
+      const gaCookies = trackingCookies.filter(
         (c) => c.provider === "Google Analytics 4",
       );
       const hasAnyGA = gaCookies.length > 0;
@@ -1238,14 +1278,14 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       return clamp(Math.round(score), 0, 100);
     })();
 
-    // ---- Overall score: 90% cookies, 10% pageSpeed
+    // Overall: tracking-cookie dominated
     let overall = clamp(
-      Math.round(cookieScore * 0.9 + pageSpeed * 0.1),
+      Math.round(cookieScore * 0.92 + pageSpeed * 0.08),
       0,
       100,
     );
 
-    // Hard rule: if there are NO first-party *tracking* cookies (catalog-matched),
+    // Hard rule: if there are NO first-party tracking cookies (catalog-matched),
     // the site cannot score above 50.
     if (fpTrackingCookies.length === 0) {
       overall = Math.min(overall, 50);
@@ -1261,12 +1301,12 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       },
       platforms,
       cookies: {
-        total: browserCookies.length,
-        firstParty: firstPartyCookies.length,
-        thirdParty: thirdPartyCookies.length,
-        serverSet: serverSetCookies.length,
-        insecure: insecureCookies.length,
-        trackingCookies: dedupedTrackingCookieRows.sort((a, b) =>
+        total: trackingCookies.length,
+        firstParty: fpTrackingCookies.length,
+        thirdParty: tpTrackingCookies.length,
+        serverSet: serverSetTrackingCookies.length,
+        insecure: insecureTrackingCookies.length,
+        trackingCookies: trackingCookies.sort((a, b) =>
           a.provider > b.provider ? 1 : -1,
         ),
       },
@@ -1282,12 +1322,15 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
       },
       debug: {
         baseDomain,
+        isHttps,
 
-        // scoring internals
+        // scoring internals (tracking-only)
         cookieScore,
         fpTrackingCookieCount: fpTrackingCookies.length,
         tpTrackingCookieCount: tpTrackingCookies.length,
+        insecureTrackingCookieCount: insecureTrackingCookies.length,
 
+        // routing / server-side evidence
         trackingHosts: Array.from(trackingHosts),
         trackingFirstPartySubdomainHosts: Array.from(
           trackingFirstPartySubdomainHosts,
@@ -1295,11 +1338,25 @@ export async function runAudit(targetUrl: string): Promise<StapeLikeReport> {
         firstPartyCollectorPOSTs: firstPartyCollectorPOSTs.length,
         fpCollectorIdKeys: Array.from(fpCollectorIdKeys),
 
+        // raw request counts
         requestCounts: {
           total: requestRecords.length,
           thirdParty: requestRecords.filter((r) => r.group === "thirdParty")
             .length,
           firstParty: requestRecords.filter((r) => r.group !== "thirdParty")
+            .length,
+        },
+
+        // raw cookie info (non-tracking) lives ONLY in debug now
+        allCookies: {
+          total: browserCookies.length,
+          firstParty: browserCookies.filter((c) =>
+            normalizeHostname(c.domain).endsWith(baseDomain),
+          ).length,
+          thirdParty: browserCookies.filter(
+            (c) => !normalizeHostname(c.domain).endsWith(baseDomain),
+          ).length,
+          serverSet: browserCookies.filter((c) => Boolean(c.setByServer))
             .length,
         },
       },

@@ -8,22 +8,20 @@ import {
 import { parse as parseTld } from "tldts";
 
 /**
- * First-party SST audit (transport-first)
+ * First-party SST audit (transport-first, SST points must be earned)
  *
- * Your rule:
- * - A site should NOT be punished for having GA / Meta / etc.
- * - A site earns points when we detect first-party, server-controlled transport signals.
+ * Key product rule:
+ * - A site should NOT be punished for having GA/Meta/etc.
+ * - A site ONLY earns points when we see credible SST transport signals:
+ *   - Browser -> FIRST-PARTY SUBDOMAIN collector POSTs
+ *   - AND at least one looks like a tracking payload (analytics-like)
  *
- * What we score:
- * - Big points for browser -> first-party collector POSTs (root/subdomain)
- * - More points when those POSTs look like tracking payloads
- * - Bonus when traffic appears "collector-only" (no direct platform collection observed)
- *
- * What we do NOT do:
- * - No negative scoring for direct platform presence (GA existing is neutral)
+ * Why this matters:
+ * - Avoid false positives from random root-domain POSTs (cart, search, forms, etc.)
+ * - Big points should only unlock when SST is actually present.
  *
  * Cookies:
- * - Not used for scoring truth. We only keep the subdomain Set-Cookie hint as a small “managed infra” bonus.
+ * - Not used for truth. Only keep "subdomain sets cookies" as a small infra hint.
  */
 
 // -----------------------------
@@ -58,7 +56,6 @@ type HostStats = {
   posts: number;
   analyticsLikePosts: number;
 
-  // cookie signal only (no scoring, no lifetime parsing)
   setCookieResponses: number;
   setCookieCount: number;
   cookieNames: Record<string, number>;
@@ -89,6 +86,12 @@ type AuditResult = {
       collectorHosts: string[];
       collectorPostCount: number;
       collectorAnalyticsLikePostCount: number;
+
+      // NEW: subdomain-only collector evidence (this is what drives score)
+      hasSubdomainCollectorPost: boolean;
+      subdomainCollectorHosts: string[];
+      subdomainCollectorPostCount: number;
+      subdomainCollectorAnalyticsLikePostCount: number;
     };
 
     subdomainCookieSignal: {
@@ -115,7 +118,6 @@ type AuditResult = {
 // -----------------------------
 // Heuristics / patterns
 // -----------------------------
-
 const ANALYTICS_BODY_HINTS = [
   "event",
   "events",
@@ -145,8 +147,6 @@ const COLLECTOR_PATH_HINTS: RegExp[] = [
   /\/capi/i,
 ];
 
-// Known direct platform collection hosts (browser -> platform).
-// We keep this for classification + “collector-only bonus”, but we do NOT penalize.
 type PlatformFlag = "ga" | "meta" | "googleAds" | "tiktok";
 
 const DIRECT_PLATFORM_HOST_PATTERNS: { name: PlatformFlag; re: RegExp }[] = [
@@ -169,7 +169,7 @@ const DIRECT_PLATFORM_PATH_HINTS: RegExp[] = [
   /\/collect/i,
   /\/g\/collect/i,
   /\/mp\/collect/i,
-  /\/tr\/?/i, // facebook.com/tr
+  /\/tr\/?/i,
   /\/events/i,
   /\/conversion/i,
 ];
@@ -235,8 +235,7 @@ function isDirectPlatformHit(
     if (p.re.test(h)) out[p.name] = true;
   }
 
-  // We keep a path check if you want to expand "other" someday,
-  // but right now we don't populate "other" here.
+  // keep for future expansion (right now "other" isn't populated)
   const hasPathCollect = DIRECT_PLATFORM_PATH_HINTS.some((re) =>
     re.test(urlLower),
   );
@@ -269,26 +268,16 @@ function countSetCookie(setCookieHeader: string | string[]): number {
 }
 
 // -----------------------------
-// Scoring knobs (easy to tune)
+// Scoring (BigDill should be ~25 without SST)
 // -----------------------------
-//
-// Base = what a “normal” site gets even if it’s client-side.
-// Bonuses = what pushes you into “wow, SST is set up” territory.
-//
-const SCORE_BASELINE = 50;
+const BASELINE_BAD_NO_SST = 25;
 
-// Collector = the big unlock
-const BONUS_COLLECTOR_PRESENT = 35;
-const BONUS_COLLECTOR_ANALYTICS_LIKE = 10;
+// SST unlock requires SUBDOMAIN + analytics-like evidence
+const BONUS_SST_UNLOCK = 55; // big jump when real SST is detected
+const BONUS_MORE_EVENTS = 10; // multiple analytics-like events
+const BONUS_COLLECTOR_ONLY = 5; // small extra credit if routed (no direct platform)
+const BONUS_SUBDOMAIN_SET_COOKIE = 3; // tiny infra hint
 
-// Collector-only = extra credit (browser not talking to platforms directly)
-const BONUS_COLLECTOR_ONLY_ANALYTICS = 5;
-const BONUS_COLLECTOR_ONLY_ADS = 5;
-
-// Small infra hint
-const BONUS_SUBDOMAIN_SET_COOKIE = 3;
-
-// Page speed should barely matter unless awful
 function pageSpeedScore(loadMs: number): number {
   if (loadMs <= 1500) return 100;
   if (loadMs <= 3000) return 92;
@@ -297,10 +286,9 @@ function pageSpeedScore(loadMs: number): number {
   return 45;
 }
 
-// A tiny “nudge” so page speed doesn’t dominate
 function pageSpeedNudge(ps: number): number {
-  // centered around 80, with very small slope
-  return Math.round((ps - 80) * 0.05); // e.g., 100 => +1, 45 => -2
+  // tiny influence only
+  return Math.round((ps - 80) * 0.05);
 }
 
 // -----------------------------
@@ -315,7 +303,6 @@ export async function runAudit(
 
   const u = new URL(url.startsWith("http") ? url : `https://${url}`);
   const targetUrl = u.toString();
-
   const baseDomain = getBaseDomain(u.hostname) || normalizeHostname(u.hostname);
 
   let browser: Browser | null = null;
@@ -331,10 +318,17 @@ export async function runAudit(
     other: [],
   };
 
+  // Root+subdomain collector evidence (kept for debugging)
   const collectorHosts = new Set<string>();
   let collectorPostCount = 0;
   let collectorAnalyticsLikePostCount = 0;
 
+  // ✅ NEW: SUBDOMAIN-only collector evidence (this drives the score)
+  const subdomainCollectorHosts = new Set<string>();
+  let subdomainCollectorPostCount = 0;
+  let subdomainCollectorAnalyticsLikePostCount = 0;
+
+  // cookie signal: which subdomains set cookies
   const subdomainCookieHosts = new Set<string>();
   let subdomainSetCookieCount = 0;
   const subdomainCookieNames: Record<string, number> = {};
@@ -371,8 +365,7 @@ export async function runAudit(
 
     // Cookie signal only
     page.on("response", async (res: Response) => {
-      const req = res.request();
-      const reqUrl = req.url();
+      const reqUrl = res.request().url();
       let hostname = "";
       try {
         hostname = normalizeHostname(new URL(reqUrl).hostname);
@@ -392,16 +385,13 @@ export async function runAudit(
 
       hs.setCookieResponses += 1;
       hs.setCookieCount += count;
-      for (const n of names) {
-        hs.cookieNames[n] = (hs.cookieNames[n] || 0) + 1;
-      }
+      for (const n of names) hs.cookieNames[n] = (hs.cookieNames[n] || 0) + 1;
 
       if (group === "subdomain") {
         subdomainCookieHosts.add(hostname);
         subdomainSetCookieCount += count;
-        for (const n of names) {
+        for (const n of names)
           subdomainCookieNames[n] = (subdomainCookieNames[n] || 0) + 1;
-        }
       }
     });
 
@@ -431,7 +421,7 @@ export async function runAudit(
       const urlLower = reqUrl.toLowerCase();
       const analyticsLike = looksAnalyticsLike(reqUrl, method, postData);
 
-      // Direct platform evidence (neutral for score, used for classification/bonuses)
+      // Direct platform evidence (neutral for score; affects classification/bonuses only)
       const dp = isDirectPlatformHit(hostname, urlLower);
       directPlatform = {
         ga: directPlatform.ga || dp.ga,
@@ -441,7 +431,7 @@ export async function runAudit(
         other: Array.from(new Set([...directPlatform.other, ...dp.other])),
       };
 
-      // First-party collector evidence (browser -> root/subdomain)
+      // Collector candidate: first-party POST to collector-ish path
       const isFirstParty = group === "root" || group === "subdomain";
       const isCollectorPath = COLLECTOR_PATH_HINTS.some((re) =>
         re.test(urlLower),
@@ -452,9 +442,20 @@ export async function runAudit(
       if (isCollectorPost) {
         collectorHosts.add(hostname);
         collectorPostCount += 1;
+        if (analyticsLike) collectorAnalyticsLikePostCount += 1;
+      }
+
+      // ✅ SUBDOMAIN-only collector evidence (this is what we trust)
+      const isSubdomainCollectorPost =
+        group === "subdomain" &&
+        method.toUpperCase() === "POST" &&
+        isCollectorPath;
+      if (isSubdomainCollectorPost) {
+        subdomainCollectorHosts.add(hostname);
+        subdomainCollectorPostCount += 1;
 
         if (analyticsLike) {
-          collectorAnalyticsLikePostCount += 1;
+          subdomainCollectorAnalyticsLikePostCount += 1;
           if (hs) hs.analyticsLikePosts += 1;
         }
       }
@@ -479,7 +480,7 @@ export async function runAudit(
     await page.waitForTimeout(2500);
 
     // -----------------------------
-    // Classification (still transport-first)
+    // Classification (transport-first)
     // -----------------------------
     const hasCollectorPost = collectorPostCount > 0;
 
@@ -492,70 +493,76 @@ export async function runAudit(
 
     const hasSubdomainSetCookie = subdomainCookieHosts.size > 0;
 
+    // SST-worthy condition (the one that should move scores)
+    const hasSstSignal =
+      subdomainCollectorAnalyticsLikePostCount > 0 &&
+      subdomainCollectorHosts.size > 0;
+
     let classification: AuditResult["classification"] = "clientSideOnly";
-    if (hasCollectorPost && !hasDirectPlatform) {
+
+    if (hasSstSignal && !hasDirectPlatform) {
       classification = hasSubdomainSetCookie
         ? "serverSideManaged"
         : "serverSideLikely";
-    } else if (hasCollectorPost && hasDirectPlatform) {
-      classification = "fpRelayClient";
+    } else if (hasSstSignal && hasDirectPlatform) {
+      classification = "fpRelayClient"; // hybrid / partial
     } else {
       classification = "clientSideOnly";
     }
 
     // -----------------------------
-    // Scores (additive / “no punishment for GA”)
+    // Scores (BigDill ~25 without SST)
     // -----------------------------
     //
-    // Baseline starts around 50.
-    // You earn points when SST signals exist.
+    // Important: we do NOT give SST points unless hasSstSignal is true.
+    // GA/Meta/etc are neutral.
     //
-    const collectorOnlyForAnalytics = hasCollectorPost && !directPlatform.ga;
+    const ps = pageSpeedScore(loadMs);
+
+    const collectorOnlyForAnalytics = hasSstSignal && !directPlatform.ga;
     const collectorOnlyForAds =
-      hasCollectorPost &&
+      hasSstSignal &&
       !directPlatform.meta &&
       !directPlatform.googleAds &&
       !directPlatform.tiktok;
 
     const analyticsScore = (() => {
-      let s = SCORE_BASELINE;
+      let s = BASELINE_BAD_NO_SST;
 
-      if (hasCollectorPost) s += BONUS_COLLECTOR_PRESENT;
-      if (collectorAnalyticsLikePostCount > 0)
-        s += BONUS_COLLECTOR_ANALYTICS_LIKE;
+      if (hasSstSignal) {
+        s += BONUS_SST_UNLOCK;
 
-      // Not a penalty. Just extra credit if analytics appears routed.
-      if (collectorOnlyForAnalytics) s += BONUS_COLLECTOR_ONLY_ANALYTICS;
+        if (subdomainCollectorAnalyticsLikePostCount >= 3)
+          s += BONUS_MORE_EVENTS;
 
-      if (hasSubdomainSetCookie) s += BONUS_SUBDOMAIN_SET_COOKIE;
+        if (collectorOnlyForAnalytics) s += BONUS_COLLECTOR_ONLY;
+
+        if (hasSubdomainSetCookie) s += BONUS_SUBDOMAIN_SET_COOKIE;
+      }
 
       return score100(s);
     })();
 
     const adsScore = (() => {
-      let s = SCORE_BASELINE;
+      let s = BASELINE_BAD_NO_SST;
 
-      if (hasCollectorPost) s += BONUS_COLLECTOR_PRESENT;
-      if (collectorAnalyticsLikePostCount > 0)
-        s += BONUS_COLLECTOR_ANALYTICS_LIKE;
+      if (hasSstSignal) {
+        s += BONUS_SST_UNLOCK;
 
-      // Not a penalty. Just extra credit if ads appear routed.
-      if (collectorOnlyForAds) s += BONUS_COLLECTOR_ONLY_ADS;
+        if (subdomainCollectorAnalyticsLikePostCount >= 3)
+          s += BONUS_MORE_EVENTS;
 
-      if (hasSubdomainSetCookie) s += BONUS_SUBDOMAIN_SET_COOKIE;
+        if (collectorOnlyForAds) s += BONUS_COLLECTOR_ONLY;
+
+        if (hasSubdomainSetCookie) s += BONUS_SUBDOMAIN_SET_COOKIE;
+      }
 
       return score100(s);
     })();
 
-    const ps = pageSpeedScore(loadMs);
-
     const overallScore = (() => {
-      // Mostly transport
       const transportCore = Math.round(0.52 * analyticsScore + 0.48 * adsScore);
-
-      // Very small speed influence
       const speed = pageSpeedNudge(ps);
-
       return score100(transportCore + speed);
     })();
 
@@ -566,25 +573,32 @@ export async function runAudit(
     ).length;
     const tpReq = totalReq - fpReq;
 
-    // Notes
-    if (!hasCollectorPost) {
+    // Notes (clear explanation for cases like BigDill)
+    if (!hasSstSignal) {
       debugNotes.push(
-        "No first-party collector POSTs detected (browser -> your root/subdomain).",
+        "No SST signal detected: no analytics-like collector POSTs to a first-party SUBDOMAIN.",
       );
       debugNotes.push(
-        "Score stays near baseline because SST transport signals were not observed.",
+        "Root-domain POSTs are ignored for SST scoring to avoid false positives (cart/forms/etc).",
+      );
+      debugNotes.push(
+        "Direct platform tags (GA/Meta/Ads) are neutral; you just don't earn SST points without a subdomain collector.",
       );
     } else {
       debugNotes.push(
-        `Detected ${collectorPostCount} first-party collector POST(s) across: ${Array.from(
-          collectorHosts,
+        `SST signal detected: ${subdomainCollectorAnalyticsLikePostCount} analytics-like collector POST(s) to subdomain(s): ${Array.from(
+          subdomainCollectorHosts,
         ).join(", ")}`,
       );
-      if (collectorAnalyticsLikePostCount > 0) {
-        debugNotes.push(
-          `Collector payloads looked analytics-like in ${collectorAnalyticsLikePostCount} POST(s).`,
-        );
-      }
+    }
+
+    if (hasCollectorPost && !hasSstSignal) {
+      debugNotes.push(
+        `Note: saw ${collectorPostCount} first-party collector-ish POST(s) (root/subdomain), but none qualified as SST (subdomain + analytics-like).`,
+      );
+      debugNotes.push(
+        `Collector-ish hosts seen (debug): ${Array.from(collectorHosts).join(", ")}`,
+      );
     }
 
     if (hasDirectPlatform) {
@@ -598,13 +612,6 @@ export async function runAudit(
         .join(", ");
       debugNotes.push(
         `Direct platform traffic detected in browser: ${direct || "Other"}. (Neutral)`,
-      );
-      debugNotes.push(
-        "Direct platform presence does not reduce score; it only affects classification/bonuses.",
-      );
-    } else {
-      debugNotes.push(
-        "No direct platform collection hosts detected in the browser.",
       );
     }
 
@@ -631,6 +638,11 @@ export async function runAudit(
           collectorHosts: Array.from(collectorHosts),
           collectorPostCount,
           collectorAnalyticsLikePostCount,
+
+          hasSubdomainCollectorPost: subdomainCollectorPostCount > 0,
+          subdomainCollectorHosts: Array.from(subdomainCollectorHosts),
+          subdomainCollectorPostCount,
+          subdomainCollectorAnalyticsLikePostCount,
         },
         subdomainCookieSignal: {
           hasSubdomainSetCookie,

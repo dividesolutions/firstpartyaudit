@@ -7,6 +7,8 @@ import {
   type Response,
 } from "playwright";
 import { parse as parseTld } from "tldts";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 
 /**
  * First-party SST audit (transport-gated)
@@ -868,7 +870,11 @@ export async function runAudit(
 // -----------------------------
 // CLI helper (node audit.ts https://example.com)
 // -----------------------------
-if (require.main === module) {
+const isMain =
+  process.argv[1] &&
+  fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+
+if (isMain) {
   (async () => {
     const url = process.argv[2];
     if (!url) {

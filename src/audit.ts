@@ -473,7 +473,10 @@ export async function runAudit(
 
     // Navigate
     const start = Date.now();
-    await page.goto(targetUrl, { waitUntil: "load", timeout: timeoutMs });
+    await page.goto(url, {
+      waitUntil: "networkidle",
+      timeout: 30000,
+    });
     loadMs = Date.now() - start;
 
     // Let late beacons fire

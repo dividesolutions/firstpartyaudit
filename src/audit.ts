@@ -557,7 +557,7 @@ async function safeGoto(
   return Date.now() - startTime;
 }
 
-export async function auditSite(url: string): Promise<AuditResult> {
+export async function runAudit(url: string): Promise<AuditResult> {
   let browser: Browser | null = null;
 
   try {

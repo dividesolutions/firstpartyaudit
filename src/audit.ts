@@ -1,9 +1,5 @@
-import {
-  chromium,
-  type Browser,
-  type Request,
-  type Response,
-} from "playwright";
+// audit.ts
+import { chromium, type Browser, type Request } from "playwright";
 import { parse as parseTld } from "tldts";
 
 // ============================================================================
@@ -79,6 +75,13 @@ interface AuditResult {
     trackingCookies: number;
     routingSignals: RoutingSignal[];
     pageLoadTime: number;
+    // extra guardrails so you can see why a job timed out
+    captureCounts: {
+      total: number;
+      http: number;
+      skippedNonHttp: number;
+      capped: boolean;
+    };
   };
 }
 
@@ -90,7 +93,6 @@ interface CookieDefinition {
   name: string;
   provider: TrackingProvider;
   category: "Ads" | "Analytics";
-  identifierPatterns?: RegExp[];
 }
 
 const COOKIE_CATALOG: CookieDefinition[] = [
@@ -130,26 +132,71 @@ const KNOWN_IDENTIFIERS = [
 ];
 
 // ============================================================================
+// SMALL UTILS / GUARDS
+// ============================================================================
+
+function normalizeInputUrl(input: string): string {
+  const t = (input || "").trim();
+  if (!t) throw new Error("Missing URL");
+  return t.startsWith("http://") || t.startsWith("https://")
+    ? t
+    : `https://${t}`;
+}
+
+function isHttpUrl(u: string): boolean {
+  return u.startsWith("http://") || u.startsWith("https://");
+}
+
+function safeHostname(u: string): string | null {
+  if (!isHttpUrl(u)) return null;
+  try {
+    return new URL(u).hostname;
+  } catch {
+    return null;
+  }
+}
+
+function withHardTimeout<T>(
+  promiseFactory: () => Promise<T>,
+  ms: number,
+  onTimeout?: () => Promise<void>,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(async () => {
+      try {
+        if (onTimeout) await onTimeout();
+      } finally {
+        reject(new Error(`Audit hard-timed-out after ${ms}ms`));
+      }
+    }, ms);
+
+    promiseFactory()
+      .then((v) => {
+        clearTimeout(t);
+        resolve(v);
+      })
+      .catch((e) => {
+        clearTimeout(t);
+        reject(e);
+      });
+  });
+}
+
+// ============================================================================
 // COOKIE CLASSIFICATION
 // ============================================================================
 
 function classifyCookie(cookie: Cookie, rootDomain: string): NormalizedCookie {
-  // Determine host type
   const cookieDomain = cookie.domain.startsWith(".")
     ? cookie.domain.substring(1)
     : cookie.domain;
 
   let hostType: "root" | "firstPartySubdomain" | "thirdParty";
-
-  if (cookieDomain === rootDomain) {
-    hostType = "root";
-  } else if (cookieDomain.endsWith(`.${rootDomain}`)) {
+  if (cookieDomain === rootDomain) hostType = "root";
+  else if (cookieDomain.endsWith(`.${rootDomain}`))
     hostType = "firstPartySubdomain";
-  } else {
-    hostType = "thirdParty";
-  }
+  else hostType = "thirdParty";
 
-  // Match against catalog
   let provider: TrackingProvider = "Unknown";
   let category: "Ads" | "Analytics" = "Analytics";
 
@@ -161,11 +208,22 @@ function classifyCookie(cookie: Cookie, rootDomain: string): NormalizedCookie {
     }
   }
 
-  // Calculate lifetime in days
+  // Playwright gives expires in UNIX seconds; some cookie typings use ms.
+  // We treat values > 10^10 as ms and <= 10^10 as seconds.
+  const expiresMs =
+    cookie.expires <= 0
+      ? -1
+      : cookie.expires > 10_000_000_000
+        ? cookie.expires
+        : cookie.expires * 1000;
+
   const lifetimeDays =
-    cookie.expires === -1
-      ? 0 // Session cookie
-      : Math.round((cookie.expires - Date.now()) / (1000 * 60 * 60 * 24));
+    expiresMs === -1
+      ? 0
+      : Math.max(
+          0,
+          Math.round((expiresMs - Date.now()) / (1000 * 60 * 60 * 24)),
+        );
 
   return {
     name: cookie.name,
@@ -180,11 +238,7 @@ function classifyCookie(cookie: Cookie, rootDomain: string): NormalizedCookie {
 }
 
 function isTrackingCookie(normalized: NormalizedCookie): boolean {
-  // Must match catalog OR contain known identifiers
-  if (normalized.provider !== "Unknown") {
-    return true;
-  }
-
+  if (normalized.provider !== "Unknown") return true;
   return KNOWN_IDENTIFIERS.some((id) => normalized.name.includes(id));
 }
 
@@ -200,21 +254,20 @@ function detectRoutingSignals(
 
   for (const capture of networkCaptures) {
     // Only analyze POST requests or requests with query params
-    if (capture.method !== "POST" && !capture.url.includes("?")) {
-      continue;
-    }
+    if (capture.method !== "POST" && !capture.url.includes("?")) continue;
 
-    const captureHostname = new URL(capture.url).hostname;
+    const captureHostname = safeHostname(capture.url);
+    if (!captureHostname) continue;
+
     const isFirstParty =
       captureHostname === rootDomain ||
       captureHostname.endsWith(`.${rootDomain}`);
 
-    // Check for identifiers in URL or POST body
     const identifiersFound: string[] = [];
-    const searchText = capture.url + (capture.postData || "");
+    const searchText = (capture.url + (capture.postData || "")).toLowerCase();
 
     for (const identifier of KNOWN_IDENTIFIERS) {
-      if (searchText.includes(identifier)) {
+      if (searchText.includes(identifier.toLowerCase())) {
         identifiersFound.push(identifier);
       }
     }
@@ -245,7 +298,7 @@ function detectRoutingSignals(
         endpoint: capture.url,
         isFirstParty,
         hasIdentifiers: true,
-        identifiersFound,
+        identifiersFound: Array.from(new Set(identifiersFound)),
       });
     }
   }
@@ -257,6 +310,33 @@ function detectRoutingSignals(
 // PLATFORM SCORING
 // ============================================================================
 
+function calculateCookieScore(
+  firstPartyCookies: NormalizedCookie[],
+  totalPlatformCookies: number,
+): number {
+  if (totalPlatformCookies === 0) return 0;
+
+  const firstPartyRatio = firstPartyCookies.length / totalPlatformCookies;
+  let score = firstPartyRatio * 40;
+
+  const avgLifetime =
+    firstPartyCookies.reduce((sum, c) => sum + c.lifetimeDays, 0) /
+    Math.max(1, firstPartyCookies.length);
+
+  if (avgLifetime >= 365) score += 20;
+  else if (avgLifetime >= 180) score += 15;
+  else if (avgLifetime >= 90) score += 10;
+  else if (avgLifetime >= 30) score += 5;
+
+  const secureCount = firstPartyCookies.filter((c) => c.secure).length;
+  const httpOnlyCount = firstPartyCookies.filter((c) => c.httpOnly).length;
+
+  score += (secureCount / Math.max(1, firstPartyCookies.length)) * 5;
+  score += (httpOnlyCount / Math.max(1, firstPartyCookies.length)) * 5;
+
+  return score;
+}
+
 function scorePlatform(
   provider: TrackingProvider,
   cookies: NormalizedCookie[],
@@ -266,21 +346,16 @@ function scorePlatform(
   const firstPartyCookies = platformCookies.filter(
     (c) => c.hostType === "root" || c.hostType === "firstPartySubdomain",
   );
+
   const platformRouting = routingSignals.filter((s) => s.provider === provider);
   const firstPartyRouting = platformRouting.filter((s) => s.isFirstParty);
 
-  let score = 0;
-  let signal: "Weak" | "Strong" | "None" = "None";
-
   // HARD CAP: No first-party cookies = low ceiling
   if (firstPartyCookies.length === 0) {
-    score = Math.min(score, 35);
-    signal = "None";
-
     return {
       platform: provider,
-      score,
-      signal,
+      score: 35,
+      signal: "None",
       estimatedRevenueLoss: "25-40%",
       resolveCTA: `Deploy first-party ${provider} cookies via server-side tagging`,
       hasFirstPartyCookies: false,
@@ -288,29 +363,24 @@ function scorePlatform(
     };
   }
 
-  // Cookie quality score (0-70 points)
-  const cookieScore = calculateCookieScore(
-    firstPartyCookies,
-    platformCookies.length,
-  );
-  score += cookieScore;
+  let score = 0;
+  let signal: "Weak" | "Strong" | "None" = "Weak";
 
-  // Routing score (0-30 points)
+  score += calculateCookieScore(firstPartyCookies, platformCookies.length);
+
   if (firstPartyRouting.length > 0) {
     score += 30;
     signal = "Strong";
   } else if (platformRouting.length > 0) {
-    // Has routing but not first-party
     score += 10;
     signal = "Weak";
   } else {
-    // No routing detected
+    score += 0;
     signal = "Weak";
   }
 
-  // Determine revenue loss and CTA
-  let estimatedRevenueLoss: string;
-  let resolveCTA: string;
+  let estimatedRevenueLoss = "25-40%";
+  let resolveCTA = `Critical: Implement first-party ${provider} infrastructure`;
 
   if (score >= 80) {
     estimatedRevenueLoss = "0-5%";
@@ -321,81 +391,22 @@ function scorePlatform(
   } else if (score >= 40) {
     estimatedRevenueLoss = "15-25%";
     resolveCTA = `Deploy server-side tagging for ${provider}`;
-  } else {
-    estimatedRevenueLoss = "25-40%";
-    resolveCTA = `Critical: Implement first-party ${provider} infrastructure`;
   }
 
   return {
     platform: provider,
-    score: Math.round(score),
+    score: Math.round(Math.min(100, Math.max(0, score))),
     signal,
     estimatedRevenueLoss,
     resolveCTA,
-    hasFirstPartyCookies: firstPartyCookies.length > 0,
+    hasFirstPartyCookies: true,
     hasServerSideRouting: firstPartyRouting.length > 0,
   };
-}
-
-function calculateCookieScore(
-  firstPartyCookies: NormalizedCookie[],
-  totalPlatformCookies: number,
-): number {
-  if (totalPlatformCookies === 0) return 0;
-
-  // Base: percentage that are first-party (0-40 points)
-  const firstPartyRatio = firstPartyCookies.length / totalPlatformCookies;
-  let score = firstPartyRatio * 40;
-
-  // Lifetime quality (0-20 points)
-  const avgLifetime =
-    firstPartyCookies.reduce((sum, c) => sum + c.lifetimeDays, 0) /
-    firstPartyCookies.length;
-
-  if (avgLifetime >= 365) {
-    score += 20;
-  } else if (avgLifetime >= 180) {
-    score += 15;
-  } else if (avgLifetime >= 90) {
-    score += 10;
-  } else if (avgLifetime >= 30) {
-    score += 5;
-  }
-
-  // Security flags (0-10 points)
-  const secureCount = firstPartyCookies.filter((c) => c.secure).length;
-  const httpOnlyCount = firstPartyCookies.filter((c) => c.httpOnly).length;
-
-  score += (secureCount / firstPartyCookies.length) * 5;
-  score += (httpOnlyCount / firstPartyCookies.length) * 5;
-
-  return score;
 }
 
 // ============================================================================
 // OVERALL SCORING
 // ============================================================================
-
-function calculateOverallScore(
-  cookies: NormalizedCookie[],
-  routingSignals: RoutingSignal[],
-  pageLoadTime: number,
-): number {
-  const trackingCookies = cookies.filter(isTrackingCookie);
-  const firstPartyTrackingCookies = trackingCookies.filter(
-    (c) => c.hostType === "root" || c.hostType === "firstPartySubdomain",
-  );
-
-  // HARD CAP: No first-party tracking cookies
-  if (firstPartyTrackingCookies.length === 0) {
-    return Math.min(
-      50,
-      calculateRawScore(cookies, routingSignals, pageLoadTime),
-    );
-  }
-
-  return calculateRawScore(cookies, routingSignals, pageLoadTime);
-}
 
 function calculateRawScore(
   cookies: NormalizedCookie[],
@@ -407,20 +418,17 @@ function calculateRawScore(
     (c) => c.hostType === "root" || c.hostType === "firstPartySubdomain",
   );
 
-  // Tracking score (0-90 points)
   let trackingScore = 0;
 
   if (trackingCookies.length > 0) {
-    // Cookie ratio (0-50 points)
     const firstPartyRatio =
-      firstPartyTrackingCookies.length / trackingCookies.length;
+      firstPartyTrackingCookies.length / Math.max(1, trackingCookies.length);
     trackingScore += firstPartyRatio * 50;
 
-    // Average lifetime (0-20 points)
     if (firstPartyTrackingCookies.length > 0) {
       const avgLifetime =
         firstPartyTrackingCookies.reduce((sum, c) => sum + c.lifetimeDays, 0) /
-        firstPartyTrackingCookies.length;
+        Math.max(1, firstPartyTrackingCookies.length);
 
       if (avgLifetime >= 365) trackingScore += 20;
       else if (avgLifetime >= 180) trackingScore += 15;
@@ -428,31 +436,40 @@ function calculateRawScore(
       else if (avgLifetime >= 30) trackingScore += 5;
     }
 
-    // Routing quality (0-20 points)
     const firstPartyRouting = routingSignals.filter((s) => s.isFirstParty);
-    if (firstPartyRouting.length >= 3) {
-      trackingScore += 20;
-    } else if (firstPartyRouting.length >= 2) {
-      trackingScore += 15;
-    } else if (firstPartyRouting.length >= 1) {
-      trackingScore += 10;
-    } else if (routingSignals.length > 0) {
-      trackingScore += 5;
-    }
+    if (firstPartyRouting.length >= 3) trackingScore += 20;
+    else if (firstPartyRouting.length >= 2) trackingScore += 15;
+    else if (firstPartyRouting.length >= 1) trackingScore += 10;
+    else if (routingSignals.length > 0) trackingScore += 5;
   }
 
-  // Page speed score (0-10 points)
+  // pageSpeed is light and can’t hang the job
   let pageSpeedScore = 10;
-  if (pageLoadTime > 3000) {
-    pageSpeedScore = 5;
-  } else if (pageLoadTime > 2000) {
-    pageSpeedScore = 8;
+  if (pageLoadTime > 3000) pageSpeedScore = 5;
+  else if (pageLoadTime > 2000) pageSpeedScore = 8;
+
+  const finalScore = trackingScore * 0.9 + pageSpeedScore * 0.1;
+  return Math.round(Math.min(100, Math.max(0, finalScore)));
+}
+
+function calculateOverallScore(
+  cookies: NormalizedCookie[],
+  routingSignals: RoutingSignal[],
+  pageLoadTime: number,
+): number {
+  const trackingCookies = cookies.filter(isTrackingCookie);
+  const firstPartyTrackingCookies = trackingCookies.filter(
+    (c) => c.hostType === "root" || c.hostType === "firstPartySubdomain",
+  );
+
+  if (firstPartyTrackingCookies.length === 0) {
+    return Math.min(
+      50,
+      calculateRawScore(cookies, routingSignals, pageLoadTime),
+    );
   }
 
-  // Final composition
-  const finalScore = trackingScore * 0.9 + pageSpeedScore * 0.1;
-
-  return Math.round(Math.min(100, Math.max(0, finalScore)));
+  return calculateRawScore(cookies, routingSignals, pageLoadTime);
 }
 
 function getLetterGrade(score: number): string {
@@ -486,9 +503,7 @@ function generateRecommendations(
   }
 
   for (const platform of platformScores) {
-    if (platform.score < 60) {
-      recommendations.push(platform.resolveCTA);
-    }
+    if (platform.score < 60) recommendations.push(platform.resolveCTA);
   }
 
   if (overallScore < 70) {
@@ -514,209 +529,224 @@ function generateRecommendations(
 }
 
 // ============================================================================
-// MAIN AUDIT FUNCTION
+// NAVIGATION (won’t get stuck)
 // ============================================================================
 
-async function safeGoto(
-  page: any,
-  url: string,
-  maxTimeout: number = 15000,
-): Promise<number> {
-  const startTime = Date.now();
+async function safeGoto(page: any, url: string): Promise<number> {
+  const start = Date.now();
 
-  // Strategy: Try progressively more lenient wait conditions
   const strategies = [
-    { waitUntil: "networkidle" as const, timeout: 10000 },
-    { waitUntil: "load" as const, timeout: 15000 },
-    { waitUntil: "domcontentloaded" as const, timeout: 20000 },
-    { waitUntil: "commit" as const, timeout: 25000 }, // Just wait for navigation to start
+    { waitUntil: "networkidle" as const, timeout: 10_000 },
+    { waitUntil: "load" as const, timeout: 15_000 },
+    { waitUntil: "domcontentloaded" as const, timeout: 20_000 },
+    { waitUntil: "commit" as const, timeout: 25_000 },
   ];
 
-  let lastError: any = null;
-
-  for (const strategy of strategies) {
+  for (const s of strategies) {
     try {
-      await page.goto(url, {
-        waitUntil: strategy.waitUntil,
-        timeout: strategy.timeout,
-      });
-      // Success! Return the load time
-      return Date.now() - startTime;
-    } catch (error: any) {
-      lastError = error;
-
-      // If it's not a timeout, throw immediately
-      if (
-        !error.message?.includes("Timeout") &&
-        !error.message?.includes("timeout")
-      ) {
-        throw error;
-      }
-
-      // If this is a timeout, try next strategy
-      console.log(
-        `Navigation with ${strategy.waitUntil} timed out, trying next strategy...`,
-      );
-      continue;
+      await page.goto(url, { waitUntil: s.waitUntil, timeout: s.timeout });
+      return Date.now() - start;
+    } catch (e: any) {
+      const msg = String(e?.message || e);
+      if (!msg.toLowerCase().includes("timeout")) throw e;
+      // try next strategy
     }
   }
 
-  // All strategies failed, but the page might have partially loaded
-  // Return what we have - better than crashing
-  console.warn(
-    "All navigation strategies timed out, proceeding with partial page load",
-  );
-  return Date.now() - startTime;
+  // Proceed with partial load
+  return Date.now() - start;
 }
+
+// ============================================================================
+// MAIN AUDIT FUNCTION (bulletproof against hanging jobs)
+// ============================================================================
 
 export async function runAudit(url: string): Promise<AuditResult> {
+  const normalizedUrl = normalizeInputUrl(url);
+
   let browser: Browser | null = null;
 
-  try {
-    // Parse root domain
-    const parsedUrl = new URL(url);
-    const tldParsed = parseTld(parsedUrl.hostname);
-    const rootDomain = tldParsed.domain || parsedUrl.hostname;
+  // capture limits (prevents memory spiral)
+  const CAPTURE_LIMIT = 5000;
+  const POSTDATA_LIMIT = 20_000;
 
-    browser = await chromium.launch({
-      headless: true,
-      args: ["--disable-dev-shm-usage", "--no-sandbox"],
-    });
+  // capture counters for debug
+  const captureCounts = {
+    total: 0,
+    http: 0,
+    skippedNonHttp: 0,
+    capped: false,
+  };
 
-    const context = await browser.newContext({
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    });
+  return withHardTimeout(
+    async () => {
+      // Parse root domain (safe)
+      const parsedUrl = new URL(normalizedUrl);
+      const tldParsed = parseTld(parsedUrl.hostname);
+      const rootDomain = tldParsed.domain || parsedUrl.hostname;
 
-    const page = await context.newPage();
-
-    // Set generous default timeouts - we handle timeouts in safeGoto
-    page.setDefaultNavigationTimeout(30000);
-    page.setDefaultTimeout(30000);
-
-    // Network capture
-    const networkCaptures: NetworkCapture[] = [];
-
-    page.on("request", (request: Request) => {
-      const postData = request.postData();
-      networkCaptures.push({
-        url: request.url(),
-        method: request.method(),
-        host: new URL(request.url()).hostname,
-        headers: request.headers(),
-        postData: postData || undefined,
-        timestamp: Date.now(),
-        resourceType: request.resourceType(),
+      browser = await chromium.launch({
+        headless: true,
+        args: ["--disable-dev-shm-usage", "--no-sandbox"],
       });
-    });
 
-    // Pass 1: Normal visit
-    let pageLoadTime = 0;
-    try {
-      pageLoadTime = await safeGoto(page, url);
-    } catch (error: any) {
-      // Even if navigation completely fails, we may have captured some network traffic
-      console.warn(
-        "Navigation failed, but continuing with captured data:",
-        error.message,
-      );
-      pageLoadTime = 30000; // Penalty for failed load
-    }
+      const context = await browser.newContext({
+        userAgent:
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        ignoreHTTPSErrors: true,
+      });
 
-    // Wait for any delayed tracking scripts
-    await page.waitForTimeout(2000).catch(() => {});
+      const page = await context.newPage();
+      page.setDefaultNavigationTimeout(30_000);
+      page.setDefaultTimeout(30_000);
 
-    // Pass 2: Synthetic click IDs (optional, best effort)
-    try {
-      const urlWithClickIds = new URL(url);
-      urlWithClickIds.searchParams.set("gclid", "test_gclid_123");
-      urlWithClickIds.searchParams.set("fbclid", "test_fbclid_456");
+      const networkCaptures: NetworkCapture[] = [];
 
-      await safeGoto(page, urlWithClickIds.toString());
-      // Wait for async tracking
+      // SAFE request capture: ignores non-http URLs; caps size; caps count
+      page.on("request", (request: Request) => {
+        captureCounts.total += 1;
+
+        const reqUrl = request.url();
+        if (!isHttpUrl(reqUrl)) {
+          captureCounts.skippedNonHttp += 1;
+          return;
+        }
+
+        const host = safeHostname(reqUrl);
+        if (!host) {
+          captureCounts.skippedNonHttp += 1;
+          return;
+        }
+
+        captureCounts.http += 1;
+
+        const rawPost = request.postData() || "";
+        const postData =
+          rawPost && rawPost.length > POSTDATA_LIMIT
+            ? rawPost.slice(0, POSTDATA_LIMIT)
+            : rawPost;
+
+        const headers = request.headers();
+        const keepHeaders: Record<string, string> = {};
+        for (const k of ["content-type", "referer", "origin", "user-agent"]) {
+          if (headers[k]) keepHeaders[k] = headers[k];
+        }
+
+        networkCaptures.push({
+          url: reqUrl,
+          method: request.method(),
+          host,
+          headers: keepHeaders,
+          postData: postData || undefined,
+          timestamp: Date.now(),
+          resourceType: request.resourceType(),
+        });
+
+        if (networkCaptures.length > CAPTURE_LIMIT) {
+          networkCaptures.shift();
+          captureCounts.capped = true;
+        }
+      });
+
+      // Pass 1: Normal visit
+      let pageLoadTime = 0;
+      try {
+        pageLoadTime = await safeGoto(page, normalizedUrl);
+      } catch (e: any) {
+        console.warn("Navigation failed, continuing:", e?.message || e);
+        pageLoadTime = 30_000;
+      }
+
       await page.waitForTimeout(2000).catch(() => {});
-    } catch (error) {
-      // If second pass fails entirely, continue with data from first pass
-      console.warn(
-        "Second pass with click IDs failed, continuing with first pass data",
+
+      // Pass 2: Synthetic click IDs (best effort)
+      try {
+        const urlWithClickIds = new URL(normalizedUrl);
+        urlWithClickIds.searchParams.set("gclid", "test_gclid_123");
+        urlWithClickIds.searchParams.set("fbclid", "test_fbclid_456");
+
+        await safeGoto(page, urlWithClickIds.toString());
+        await page.waitForTimeout(2000).catch(() => {});
+      } catch {
+        // ignore
+      }
+
+      // Cookies
+      const rawCookies = await context.cookies();
+
+      // Always attempt close quickly after we’ve got data
+      await browser.close().catch(() => {});
+      browser = null;
+
+      // Classify cookies
+      const normalizedCookies = rawCookies.map((c) =>
+        classifyCookie(c as unknown as Cookie, rootDomain),
       );
-    }
 
-    // Capture cookies
-    const rawCookies = await context.cookies();
+      const trackingCookies = normalizedCookies.filter(isTrackingCookie);
+      const firstPartyCookies = normalizedCookies.filter(
+        (c) => c.hostType === "root" || c.hostType === "firstPartySubdomain",
+      );
+      const thirdPartyCookies = normalizedCookies.filter(
+        (c) => c.hostType === "thirdParty",
+      );
 
-    await browser.close();
-    browser = null;
+      // Detect routing
+      const routingSignals = detectRoutingSignals(networkCaptures, rootDomain);
 
-    // Classify cookies
-    const normalizedCookies = rawCookies.map((c) =>
-      classifyCookie(c, rootDomain),
-    );
-    const trackingCookies = normalizedCookies.filter(isTrackingCookie);
-    const firstPartyCookies = normalizedCookies.filter(
-      (c) => c.hostType === "root" || c.hostType === "firstPartySubdomain",
-    );
-    const thirdPartyCookies = normalizedCookies.filter(
-      (c) => c.hostType === "thirdParty",
-    );
+      // Score platforms
+      const providers: TrackingProvider[] = [
+        "Meta",
+        "Google Analytics",
+        "Google Ads",
+        "TikTok",
+      ];
 
-    // Detect routing
-    const routingSignals = detectRoutingSignals(networkCaptures, rootDomain);
+      const platformScores = providers
+        .map((provider) =>
+          scorePlatform(provider, normalizedCookies, routingSignals),
+        )
+        .filter((ps) => ps.hasFirstPartyCookies || ps.hasServerSideRouting);
 
-    // Score platforms
-    const providers: TrackingProvider[] = [
-      "Meta",
-      "Google Analytics",
-      "Google Ads",
-      "TikTok",
-    ];
-    const platformScores = providers
-      .map((provider) =>
-        scorePlatform(provider, normalizedCookies, routingSignals),
-      )
-      .filter((ps) => ps.hasFirstPartyCookies || ps.hasServerSideRouting);
-
-    // Calculate overall score
-    const overallScore = calculateOverallScore(
-      normalizedCookies,
-      routingSignals,
-      pageLoadTime,
-    );
-    const letterGrade = getLetterGrade(overallScore);
-
-    // Generate recommendations
-    const recommendedActions = generateRecommendations(
-      overallScore,
-      platformScores,
-      normalizedCookies,
-    );
-
-    return {
-      overallScore,
-      letterGrade,
-      platformScores,
-      recommendedActions,
-      debugInfo: {
-        totalCookies: normalizedCookies.length,
-        firstPartyCookies: firstPartyCookies.length,
-        thirdPartyCookies: thirdPartyCookies.length,
-        trackingCookies: trackingCookies.length,
+      // Overall score
+      const overallScore = calculateOverallScore(
+        normalizedCookies,
         routingSignals,
         pageLoadTime,
-      },
-    };
-  } catch (error) {
-    if (browser) {
-      await browser.close();
-    }
-    throw error;
-  }
+      );
+      const letterGrade = getLetterGrade(overallScore);
+
+      // Recommendations
+      const recommendedActions = generateRecommendations(
+        overallScore,
+        platformScores,
+        normalizedCookies,
+      );
+
+      return {
+        overallScore,
+        letterGrade,
+        platformScores,
+        recommendedActions,
+        debugInfo: {
+          totalCookies: normalizedCookies.length,
+          firstPartyCookies: firstPartyCookies.length,
+          thirdPartyCookies: thirdPartyCookies.length,
+          trackingCookies: trackingCookies.length,
+          routingSignals,
+          pageLoadTime,
+          captureCounts,
+        },
+      };
+    },
+    120_000, // hard cap per audit so worker never stays "running" forever
+    async () => {
+      if (browser) {
+        try {
+          await browser.close();
+        } catch {}
+        browser = null;
+      }
+    },
+  );
 }
-
-// ============================================================================
-// EXAMPLE USAGE
-// ============================================================================
-
-// Uncomment to run:
-// auditSite("https://example.com").then(result => {
-//   console.log(JSON.stringify(result, null, 2));
-// });

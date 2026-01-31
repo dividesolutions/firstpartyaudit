@@ -2,7 +2,6 @@
 import {
   chromium,
   type Browser,
-  type Page,
   type Request,
   type Response,
 } from "playwright";
@@ -31,9 +30,7 @@ import path from "node:path";
 // Types
 // -----------------------------
 type HostGroup = "root" | "subdomain" | "thirdParty";
-
 type Party = "firstParty" | "thirdParty";
-
 type TrackingMethod = "client" | "server" | "unknown";
 
 type CookieRow = {
@@ -277,6 +274,69 @@ const COLLECTOR_PATH_HINTS: RegExp[] = [
 ];
 
 // -----------------------------
+// Common first-party SST / collector subdomains
+// (what you listed)
+// -----------------------------
+const COLLECTOR_SUBDOMAIN_PREFIXES = [
+  "api",
+  "app",
+  "edge",
+  "ingest",
+  "log",
+  "logs",
+  "pipe",
+  "stream",
+  "gtm",
+  "sgtm",
+  "ss",
+  "ssgtm",
+  "server",
+  "server-gtm",
+  "tag",
+  "tags",
+  "data",
+  "events",
+  "track",
+  "tracking",
+  "analytics",
+  "metrics",
+  "collect",
+  "collector",
+  "stats",
+  "beacon",
+  "pixel",
+  "signals",
+  "fp",
+];
+
+// Matches:
+// - api.domain.com
+// - ingest.domain.com
+// - sgtm.domain.com
+// - gtm.us.domain.com
+// - server-gtm.eu.domain.com
+function isLikelyCollectorSubdomain(
+  hostname: string,
+  baseDomain: string,
+): boolean {
+  const h = normalizeHostname(hostname);
+  const bd = normalizeHostname(baseDomain);
+
+  if (!h || !bd) return false;
+  if (!h.endsWith("." + bd)) return false;
+
+  // remove ".baseDomain" -> get subdomain part
+  const left = h.slice(0, -(bd.length + 1));
+  if (!left) return false;
+
+  // take the label closest to the root domain (first label)
+  // e.g. "gtm.us" -> "gtm"
+  const label = left.split(".")[0].toLowerCase();
+
+  return COLLECTOR_SUBDOMAIN_PREFIXES.includes(label);
+}
+
+// -----------------------------
 // Helpers
 // -----------------------------
 function normalizeHostname(h: string): string {
@@ -346,11 +406,9 @@ function looksAnalyticsLike(
 
   if (method.toUpperCase() !== "POST") return false;
 
-  // payload heuristics
   const body = (postData || "").toLowerCase();
   if (!body) return false;
 
-  // typical analytics-ish keys
   const bodyHints = [
     "event",
     "client_id",
@@ -363,16 +421,16 @@ function looksAnalyticsLike(
     "user_agent",
     "page_location",
   ];
-  const hasBodyHint = bodyHints.some((k) => body.includes(k));
-  return hasBodyHint;
+  return bodyHints.some((k) => body.includes(k));
 }
 
 function findClickIdKeysInText(text: string): string[] {
   const t = (text || "").toLowerCase();
   const hits: string[] = [];
   for (const k of CLICK_ID_KEYS) {
-    if (t.includes(k + "=") || t.includes(`"${k}"`) || t.includes(`${k}:`))
+    if (t.includes(k + "=") || t.includes(`"${k}"`) || t.includes(`${k}:`)) {
       hits.push(k);
+    }
   }
   return Array.from(new Set(hits));
 }
@@ -387,12 +445,13 @@ function catalogMatch(cookieName: string): CookieCatalogEntry | null {
 
 function computeLifetimeDays(expires?: string | number | null): number | null {
   if (!expires) return null;
-  // Playwright cookies use expires as unix seconds (number). Sometimes string in our normalized row.
+
   if (typeof expires === "number") {
     if (expires <= 0) return null;
     const ms = expires * 1000 - Date.now();
     return ms > 0 ? Math.round(ms / (1000 * 60 * 60 * 24)) : 0;
   }
+
   const d = new Date(expires);
   if (Number.isNaN(d.getTime())) return null;
   const ms = d.getTime() - Date.now();
@@ -400,7 +459,6 @@ function computeLifetimeDays(expires?: string | number | null): number | null {
 }
 
 function isInsecureCookie(c: CookieRow): boolean {
-  // insecure = not Secure or SameSite=None without Secure (classic bad config)
   if (!c.secure) return true;
   if ((c.sameSite || "").toLowerCase() === "none" && !c.secure) return true;
   return false;
@@ -423,15 +481,12 @@ export async function runAudit(
 
   let browser: Browser | null = null;
 
-  // request / response capture
   const requestRecords: RequestRecord[] = [];
   const hostMap = new Map<string, HostStats>();
 
-  // cookie set-method tracking via Set-Cookie
   const serverSetCookieNames = new Set<string>();
   const responseSetCookieCountByHost = new Map<string, number>();
 
-  // direct platform evidence
   let directPlatform = {
     ga: false,
     meta: false,
@@ -440,13 +495,11 @@ export async function runAudit(
     other: [] as string[],
   };
 
-  // collector evidence
   const collectorHosts = new Set<string>();
   let collectorPostCount = 0;
   let collectorAnalyticsLikePostCount = 0;
   const collectorClickIdKeys = new Set<string>();
 
-  // crude perf
   const perf = { navStart: 0, loadMs: 0 };
 
   try {
@@ -466,16 +519,15 @@ export async function runAudit(
       const headers = await res.headers();
       const setCookie = headers["set-cookie"];
       if (setCookie) {
-        // count entries: multiple cookies may be in a single header string
         const count = Array.isArray(setCookie)
           ? setCookie.length
           : setCookie.split(/,(?=[^;]+=[^;]+)/).length;
+
         responseSetCookieCountByHost.set(
           host,
           (responseSetCookieCountByHost.get(host) || 0) + count,
         );
 
-        // try to parse cookie names
         const raw = Array.isArray(setCookie) ? setCookie : [setCookie];
         for (const line of raw) {
           const parts = line.split(";")[0];
@@ -503,6 +555,7 @@ export async function runAudit(
       } catch {
         hostname = "";
       }
+
       const group = hostname ? groupHost(hostname, baseDomain) : "thirdParty";
       const method = req.method();
       const resourceType = req.resourceType();
@@ -517,17 +570,14 @@ export async function runAudit(
 
       // direct platform evidence
       const dp = isDirectPlatformHost(hostname);
-      // reinforce only when path hints look like collection
       const pathLooksCollect = DIRECT_PLATFORM_PATH_HINTS.some((re) =>
         re.test(urlText),
       );
+
       if (dp.ga && pathLooksCollect) directPlatform.ga = true;
       if (dp.meta && pathLooksCollect) directPlatform.meta = true;
       if (dp.googleAds && pathLooksCollect) directPlatform.googleAds = true;
       if (dp.tiktok && pathLooksCollect) directPlatform.tiktok = true;
-
-      // still track “platform present” (scripts) but not as strong as collect
-      // NOTE: we purposely do not set directPlatform.ga true just because gtm scripts loaded.
 
       const rec: RequestRecord = {
         url: reqUrl,
@@ -567,10 +617,18 @@ export async function runAudit(
 
       // collector evidence (first-party only)
       const isFirstPartyHost = group === "root" || group === "subdomain";
+      const pathLooksCollector = COLLECTOR_PATH_HINTS.some((re) =>
+        re.test(urlText),
+      );
+      const hostLooksCollector = hostname
+        ? isLikelyCollectorSubdomain(hostname, baseDomain)
+        : false;
+
+      // first-party + POST + (collector-ish path OR collector-ish subdomain)
       if (
         isFirstPartyHost &&
         method === "POST" &&
-        COLLECTOR_PATH_HINTS.some((re) => re.test(urlText))
+        (pathLooksCollector || hostLooksCollector)
       ) {
         collectorHosts.add(hostname);
         collectorPostCount += 1;
@@ -588,10 +646,8 @@ export async function runAudit(
     // Let late beacons fire
     await page.waitForTimeout(2500).catch(() => null);
 
-    // Pull cookies from context
     const rawCookies = await context.cookies();
 
-    // Convert cookies + party + setMethod
     const allCookies: CookieRow[] = rawCookies.map((c): CookieRow => {
       const party: Party = c.domain.replace(/^\./, "").endsWith(baseDomain)
         ? "firstParty"
@@ -626,7 +682,6 @@ export async function runAudit(
       collectorPostCount > 0 && collectorAnalyticsLikePostCount > 0;
     const clicky = collectorClickIdKeys.size > 0;
 
-    // Force enhancedCookies to also be CookieRow[] (no unions)
     const enhancedCookies: CookieRow[] = allCookies.map((c): CookieRow => {
       if (c.trackingRelevant) return c;
 
@@ -638,7 +693,6 @@ export async function runAudit(
         return {
           ...c,
           trackingRelevant: true,
-          // keep these inside the CookieRow union values
           category: "Unknown",
           provider: c.provider ?? "Unknown",
         };
@@ -647,7 +701,6 @@ export async function runAudit(
       return c;
     });
 
-    // trackingCookies is now safely CookieRow[]
     const trackingCookies: CookieRow[] = enhancedCookies.filter(
       (c) => c.trackingRelevant,
     );
@@ -658,7 +711,6 @@ export async function runAudit(
     const tpTrackingCookies = trackingCookies.filter(
       (c) => c.party === "thirdParty",
     );
-
     const insecureTrackingCookies = trackingCookies.filter(isInsecureCookie);
 
     // -----------------------------
@@ -667,82 +719,66 @@ export async function runAudit(
     const hasFirstPartyCollectorPost =
       collectorPostCount > 0 && collectorAnalyticsLikePostCount > 0;
 
-    // direct platform collection: look for any request to platform hosts that also looks like a collect endpoint
-    // (we already set directPlatform flags in request hook when host+path looked collect)
     const hasDirectPlatformCollect =
       directPlatform.ga ||
       directPlatform.meta ||
       directPlatform.googleAds ||
       directPlatform.tiktok;
 
-    // SST unlocked only if:
-    // - we have first-party collector analytics-like POSTs
-    // - and we do NOT have direct platform collection
     const hasServerSideTransport =
       hasFirstPartyCollectorPost && !hasDirectPlatformCollect;
 
-    // Determine "managed" vs "fully first-party" (simple heuristic)
-    // If collector hosts include "stape.io" (or similar), call it managed.
     const managedCollector = Array.from(collectorHosts).some((h) =>
       /stape\.io$/i.test(h),
     );
 
     let classification: AuditResult["classification"] = "clientSideOnly";
-    if (hasServerSideTransport)
+    if (hasServerSideTransport) {
       classification = managedCollector
         ? "serverSideManaged"
         : "serverSideLikely";
-    else if (hasFirstPartyCollectorPost && hasDirectPlatformCollect)
-      classification = "fpRelayClient"; // browser posts to FP endpoint but still calls platforms directly
+    } else if (hasFirstPartyCollectorPost && hasDirectPlatformCollect) {
+      classification = "fpRelayClient";
+    }
 
     // -----------------------------
     // Scoring
     // -----------------------------
-    // Cookie lifetime score (tracking cookies only)
     const cookieLifetimeScore = (() => {
       if (!trackingCookies.length) return 0;
+
       const unknownOrShort = trackingCookies.filter(
         (c) => c.lifetimeDays === null || (c.lifetimeDays ?? 0) < 7,
       ).length;
+
       const insecureRatio = ratio(
         insecureTrackingCookies.length,
         trackingCookies.length,
       );
       const shortRatio = ratio(unknownOrShort, trackingCookies.length);
 
-      // Start at 100, penalize insecure + very short
       let s = 100;
       s -= insecureRatio * 45;
       s -= shortRatio * 35;
 
-      // Slight bonus if most tracking cookies are first-party
       const fpRatio = ratio(fpTrackingCookies.length, trackingCookies.length);
       s += fpRatio * 10;
 
       return score100(s);
     })();
 
-    // Ads / analytics scores:
-    // IMPORTANT: If server-side transport is NOT unlocked, do not award "server-side" credit.
-    // These are more like “implementation quality”, but transport dominates.
     const adsScore = (() => {
-      // Base from cookie health only (not presence)
       const base = cookieLifetimeScore;
-
-      // If transport unlocked, reward; if direct platform collection, penalize hard
       let s = base;
 
       if (hasServerSideTransport) {
         s += 12;
-        // supporting evidence once unlocked: click IDs present in collector traffic
         if (collectorClickIdKeys.size > 0) s += 8;
       } else {
-        // client-side transport: penalize, even if cookies look clean
         s -= 25;
         if (hasDirectPlatformCollect) s -= 15;
       }
 
-      // if no first-party tracking cookies at all, cap
       if (fpTrackingCookies.length === 0) s = Math.min(s, 50);
 
       return score100(s);
@@ -763,9 +799,7 @@ export async function runAudit(
       return score100(s);
     })();
 
-    // pageSpeed: intentionally light. Only punish truly bad loads.
     const pageSpeedScore = (() => {
-      // 0-2s => 100, 2-6s => linear down to 60, >6s => down to 30
       const ms = perf.loadMs;
       if (ms <= 2000) return 100;
       if (ms <= 6000) {
@@ -776,22 +810,17 @@ export async function runAudit(
       return score100(60 - t * 30);
     })();
 
-    // overall: 90% cookie/transport, 10% pageSpeed
     const overallScore = (() => {
-      // transport gate affects overall heavily
-      // If NOT unlocked, overall can't exceed ~65 even with perfect cookies.
       const core = score100(
         0.45 * adsScore + 0.45 * analyticsScore + 0.1 * cookieLifetimeScore,
       );
       let o = core;
 
       if (!hasServerSideTransport) {
-        // This is the key fix for Bigdill-style false positives
         o = Math.min(o, hasFirstPartyCollectorPost ? 65 : 55);
         if (hasDirectPlatformCollect) o = Math.min(o, 55);
       }
 
-      // blend slight pageSpeed influence
       o = score100(0.9 * o + 0.1 * pageSpeedScore);
       return o;
     })();

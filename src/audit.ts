@@ -517,7 +517,47 @@ function generateRecommendations(
 // MAIN AUDIT FUNCTION
 // ============================================================================
 
-export async function runAudit(url: string): Promise<AuditResult> {
+async function safeGoto(
+  page: any,
+  url: string,
+  timeout: number = 15000,
+): Promise<number> {
+  const startTime = Date.now();
+
+  try {
+    // Try networkidle first with shorter timeout
+    await page.goto(url, {
+      waitUntil: "networkidle",
+      timeout: timeout,
+    });
+  } catch (error: any) {
+    if (error.message?.includes("Timeout")) {
+      // Fallback to 'load' event which is more forgiving
+      try {
+        await page.goto(url, {
+          waitUntil: "load",
+          timeout: timeout,
+        });
+      } catch (loadError: any) {
+        if (loadError.message?.includes("Timeout")) {
+          // Final fallback: just wait for DOM content
+          await page.goto(url, {
+            waitUntil: "domcontentloaded",
+            timeout: timeout,
+          });
+        } else {
+          throw loadError;
+        }
+      }
+    } else {
+      throw error;
+    }
+  }
+
+  return Date.now() - startTime;
+}
+
+export async function auditSite(url: string): Promise<AuditResult> {
   let browser: Browser | null = null;
 
   try {
@@ -526,12 +566,20 @@ export async function runAudit(url: string): Promise<AuditResult> {
     const tldParsed = parseTld(parsedUrl.hostname);
     const rootDomain = tldParsed.domain || parsedUrl.hostname;
 
-    browser = await chromium.launch({ headless: true });
+    browser = await chromium.launch({
+      headless: true,
+      args: ["--disable-dev-shm-usage", "--no-sandbox"],
+    });
+
     const context = await browser.newContext({
       userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     });
 
     const page = await context.newPage();
+
+    // Set default navigation timeout
+    page.setDefaultNavigationTimeout(20000);
+    page.setDefaultTimeout(20000);
 
     // Network capture
     const networkCaptures: NetworkCapture[] = [];
@@ -550,19 +598,26 @@ export async function runAudit(url: string): Promise<AuditResult> {
     });
 
     // Pass 1: Normal visit
-    const startTime = Date.now();
-    await page.goto(url, { waitUntil: "networkidle" });
-    const pageLoadTime = Date.now() - startTime;
+    const pageLoadTime = await safeGoto(page, url, 15000);
+
+    // Wait for any delayed tracking scripts
+    await page.waitForTimeout(1500);
 
     // Pass 2: Synthetic click IDs
     const urlWithClickIds = new URL(url);
     urlWithClickIds.searchParams.set("gclid", "test_gclid_123");
     urlWithClickIds.searchParams.set("fbclid", "test_fbclid_456");
 
-    await page.goto(urlWithClickIds.toString(), { waitUntil: "networkidle" });
-
-    // Wait a bit for async tracking
-    await page.waitForTimeout(2000);
+    try {
+      await safeGoto(page, urlWithClickIds.toString(), 10000);
+      // Wait for async tracking
+      await page.waitForTimeout(1500);
+    } catch (error) {
+      // If second pass fails, continue with data from first pass
+      console.warn(
+        "Second pass with click IDs failed, continuing with first pass data",
+      );
+    }
 
     // Capture cookies
     const rawCookies = await context.cookies();

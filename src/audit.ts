@@ -520,40 +520,52 @@ function generateRecommendations(
 async function safeGoto(
   page: any,
   url: string,
-  timeout: number = 15000,
+  maxTimeout: number = 15000,
 ): Promise<number> {
   const startTime = Date.now();
 
-  try {
-    // Try networkidle first with shorter timeout
-    await page.goto(url, {
-      waitUntil: "networkidle",
-      timeout: timeout,
-    });
-  } catch (error: any) {
-    if (error.message?.includes("Timeout")) {
-      // Fallback to 'load' event which is more forgiving
-      try {
-        await page.goto(url, {
-          waitUntil: "load",
-          timeout: timeout,
-        });
-      } catch (loadError: any) {
-        if (loadError.message?.includes("Timeout")) {
-          // Final fallback: just wait for DOM content
-          await page.goto(url, {
-            waitUntil: "domcontentloaded",
-            timeout: timeout,
-          });
-        } else {
-          throw loadError;
-        }
+  // Strategy: Try progressively more lenient wait conditions
+  const strategies = [
+    { waitUntil: "networkidle" as const, timeout: 10000 },
+    { waitUntil: "load" as const, timeout: 15000 },
+    { waitUntil: "domcontentloaded" as const, timeout: 20000 },
+    { waitUntil: "commit" as const, timeout: 25000 }, // Just wait for navigation to start
+  ];
+
+  let lastError: any = null;
+
+  for (const strategy of strategies) {
+    try {
+      await page.goto(url, {
+        waitUntil: strategy.waitUntil,
+        timeout: strategy.timeout,
+      });
+      // Success! Return the load time
+      return Date.now() - startTime;
+    } catch (error: any) {
+      lastError = error;
+
+      // If it's not a timeout, throw immediately
+      if (
+        !error.message?.includes("Timeout") &&
+        !error.message?.includes("timeout")
+      ) {
+        throw error;
       }
-    } else {
-      throw error;
+
+      // If this is a timeout, try next strategy
+      console.log(
+        `Navigation with ${strategy.waitUntil} timed out, trying next strategy...`,
+      );
+      continue;
     }
   }
 
+  // All strategies failed, but the page might have partially loaded
+  // Return what we have - better than crashing
+  console.warn(
+    "All navigation strategies timed out, proceeding with partial page load",
+  );
   return Date.now() - startTime;
 }
 
@@ -577,9 +589,9 @@ export async function runAudit(url: string): Promise<AuditResult> {
 
     const page = await context.newPage();
 
-    // Set default navigation timeout
-    page.setDefaultNavigationTimeout(20000);
-    page.setDefaultTimeout(20000);
+    // Set generous default timeouts - we handle timeouts in safeGoto
+    page.setDefaultNavigationTimeout(30000);
+    page.setDefaultTimeout(30000);
 
     // Network capture
     const networkCaptures: NetworkCapture[] = [];
@@ -598,22 +610,32 @@ export async function runAudit(url: string): Promise<AuditResult> {
     });
 
     // Pass 1: Normal visit
-    const pageLoadTime = await safeGoto(page, url, 15000);
+    let pageLoadTime = 0;
+    try {
+      pageLoadTime = await safeGoto(page, url);
+    } catch (error: any) {
+      // Even if navigation completely fails, we may have captured some network traffic
+      console.warn(
+        "Navigation failed, but continuing with captured data:",
+        error.message,
+      );
+      pageLoadTime = 30000; // Penalty for failed load
+    }
 
     // Wait for any delayed tracking scripts
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(2000).catch(() => {});
 
-    // Pass 2: Synthetic click IDs
-    const urlWithClickIds = new URL(url);
-    urlWithClickIds.searchParams.set("gclid", "test_gclid_123");
-    urlWithClickIds.searchParams.set("fbclid", "test_fbclid_456");
-
+    // Pass 2: Synthetic click IDs (optional, best effort)
     try {
-      await safeGoto(page, urlWithClickIds.toString(), 10000);
+      const urlWithClickIds = new URL(url);
+      urlWithClickIds.searchParams.set("gclid", "test_gclid_123");
+      urlWithClickIds.searchParams.set("fbclid", "test_fbclid_456");
+
+      await safeGoto(page, urlWithClickIds.toString());
       // Wait for async tracking
-      await page.waitForTimeout(1500);
+      await page.waitForTimeout(2000).catch(() => {});
     } catch (error) {
-      // If second pass fails, continue with data from first pass
+      // If second pass fails entirely, continue with data from first pass
       console.warn(
         "Second pass with click IDs failed, continuing with first pass data",
       );
@@ -689,3 +711,12 @@ export async function runAudit(url: string): Promise<AuditResult> {
     throw error;
   }
 }
+
+// ============================================================================
+// EXAMPLE USAGE
+// ============================================================================
+
+// Uncomment to run:
+// auditSite("https://example.com").then(result => {
+//   console.log(JSON.stringify(result, null, 2));
+// });

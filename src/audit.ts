@@ -474,13 +474,12 @@ export async function runAudit(
     // Navigate
     const start = Date.now();
     await page.goto(url, {
-      waitUntil: "networkidle",
+      waitUntil: "domcontentloaded",
       timeout: 30000,
     });
-    loadMs = Date.now() - start;
 
-    // Let late beacons fire
-    await page.waitForTimeout(2500);
+    // observation window
+    await page.waitForTimeout(7000);
 
     // -----------------------------
     // Classification (transport-first)

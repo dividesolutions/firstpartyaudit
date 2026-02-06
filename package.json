@@ -7,23 +7,33 @@
     "start": "tsx src/server.ts",
     "worker": "tsx src/worker.ts",
     "build": "tsc",
-    "start:worker": "node dist/worker.js"
+    "start:worker": "node dist/worker.js",
+    "test-audit": "node --loader ts-node/esm src/test.ts"
   },
   "dependencies": {
     "@fastify/cors": "^8.5.0",
     "dotenv": "^17.2.3",
     "fastify": "^4.29.1",
     "pg": "^8.16.3",
-    "playwright": "^1.57.0",
-    "tldts": "^7.0.19",
+    "playwright": "^1.58.1",
+    "tldts": "^7.0.21",
     "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@types/node": "^20.19.27",
+    "@types/node": "^20.19.31",
     "@types/pg": "^8.16.0",
     "ts-node": "^10.9.2",
     "ts-node-dev": "^2.0.0",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3"
-  }
+  },
+  "description": "��#\u0000 \u0000f\u0000i\u0000r\u0000s\u0000t\u0000p\u0000a\u0000r\u0000t\u0000y\u0000a\u0000u\u0000d\u0000i\u0000t\u0000\r\u0000 \u0000",
+  "main": "index.js",
+  "repository": {
+    "type": "git",
+    "url": "git@github-personal:dividesolutions/firstpartyaudit.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
 }

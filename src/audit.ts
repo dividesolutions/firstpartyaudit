@@ -145,6 +145,16 @@ const COOKIE_CATALOG: CookieCatalogEntry[] = [
 
   // Google Ads
   { provider: "Google Ads", category: "Ads", match: (n) => n === "_gcl_au" },
+  {
+    provider: "Google Ads",
+    category: "Ads",
+    match: (n) => n.toLowerCase() === "fpgclaw",
+  },
+  {
+    provider: "Google Ads",
+    category: "Ads",
+    match: (n) => n.toLowerCase() === "fpid",
+  },
 
   // TikTok
   { provider: "TikTok", category: "Ads", match: (n) => n === "_ttp" },
@@ -163,6 +173,8 @@ function isKnownIdentifierCookieName(name: string): boolean {
     n === "_fbp" ||
     n === "_fbc" ||
     n === "_gcl_au" ||
+    n === "fpgclaw" ||
+    n === "fpid" ||
     n === "_ttp" ||
     n === "li_fat_id" ||
     n === "_li_dcdm_c"
@@ -183,6 +195,9 @@ function inferProviderFromName(name: string): {
   if (n === "_gcl_au") return { provider: "Google Ads", category: "Ads" };
   if (n === "_ga" || n.startsWith("_ga_"))
     return { provider: "Google Analytics", category: "Analytics" };
+  if (n === "fpgclaw") return { provider: "Google Ads", category: "Ads" };
+
+  if (n === "fpid") return { provider: "Google Ads", category: "Ads" };
 
   return { provider: "Unknown", category: "Analytics" };
 }

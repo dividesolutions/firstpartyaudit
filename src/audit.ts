@@ -158,6 +158,11 @@ const COOKIE_CATALOG: CookieCatalogEntry[] = [
 
   // TikTok
   { provider: "TikTok", category: "Ads", match: (n) => n === "_ttp" },
+  {
+    provider: "TikTok",
+    category: "Ads",
+    match: (n) => n.toLowerCase() === "ttcsid",
+  },
 
   // LinkedIn (Insight Tag / advertiser-side identifier)
   { provider: "LinkedIn", category: "Ads", match: (n) => n === "li_fat_id" },
@@ -176,6 +181,7 @@ function isKnownIdentifierCookieName(name: string): boolean {
     n === "fpgclaw" ||
     n === "fpid" ||
     n === "_ttp" ||
+    n === "ttcsid" ||
     n === "li_fat_id" ||
     n === "_li_dcdm_c"
   );
@@ -190,6 +196,7 @@ function inferProviderFromName(name: string): {
   if (n === "_fbp" || n === "_fbc")
     return { provider: "Meta", category: "Ads" };
   if (n === "_ttp") return { provider: "TikTok", category: "Ads" };
+  if (n === "ttcsid") return { provider: "TikTok", category: "Ads" };
   if (n === "li_fat_id" || n === "_li_dcdm_c")
     return { provider: "LinkedIn", category: "Ads" };
   if (n === "_gcl_au") return { provider: "Google Ads", category: "Ads" };

@@ -610,10 +610,12 @@ async function capturePass(
   });
 
   const start = Date.now();
+  const passStart = Date.now();
+  const passBudgetMs = Math.min(25_000, Math.floor(timeoutMs * 0.6));
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: timeoutMs });
     await handleConsentAndNudge(page, timeoutMs);
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(700);
   } catch (e: any) {
     notes.push(
       `${isSecondPass ? "Pass 2" : "Pass 1"} navigation error: ${String(
@@ -634,17 +636,22 @@ async function capturePass(
   try {
     // Give analytics/consent stacks time to set late cookies (GA/Meta/etc.)
     await page
-      .waitForLoadState("networkidle", {
-        timeout: Math.min(10_000, timeoutMs),
-      })
+      .waitForLoadState("load", { timeout: Math.min(8_000, timeoutMs) })
       .catch(() => {});
 
     // Wait until cookie jar stops changing for a short window (best-effort, capped)
-    const raw = await collectCookiesUntilStable(context, {
-      maxWaitMs: 20_000,
-      stableForMs: 2_500,
-      intervalMs: 250,
-    });
+    const elapsed = Date.now() - passStart;
+    const remaining = passBudgetMs - elapsed;
+
+    // If we're low on time, take a quick snapshot
+    const raw =
+      remaining > 2_000
+        ? await collectCookiesUntilStable(context, {
+            maxWaitMs: Math.min(8_000, remaining), // cap it hard
+            stableForMs: 1_200, // shorter stability window
+            intervalMs: 250,
+          })
+        : await context.cookies().catch(() => []);
 
     contextCookies = raw.map((c: any) => ({
       name: c.name,

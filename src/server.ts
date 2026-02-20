@@ -10,7 +10,7 @@ const app = Fastify({ logger: true });
 
 await app.register(cors, {
   origin: (origin, cb) => {
-    const allowed = ["http://localhost:5173"];
+    const allowed = ["http://localhost:5173", "https://track.gofirstparty.com"];
 
     // allow non-browser tools (curl, server-to-server)
     if (!origin) return cb(null, true);
@@ -21,7 +21,7 @@ await app.register(cors, {
       cb(new Error("Not allowed by CORS"), false);
     }
   },
-  credentials: true,
+  credentials: false,
 });
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -76,7 +76,7 @@ app.post("/audits", async (req, reply) => {
     VALUES ($1, $2, 'queued', 0)
     RETURNING id
     `,
-    [url, email ?? null]
+    [url, email ?? null],
   );
 
   return reply.code(201).send({ id: result.rows[0].id });
@@ -100,7 +100,7 @@ app.patch("/audits/:id/email", async (req, reply) => {
 
   const result = await pool.query(
     `UPDATE audits SET email = $2, updated_at = NOW() WHERE id = $1 RETURNING id, email`,
-    [id, parsed.data.email]
+    [id, parsed.data.email],
   );
 
   if (result.rowCount === 0)
@@ -124,7 +124,7 @@ app.get("/audits/:id", async (req, reply) => {
     FROM audits
     WHERE id = $1
     `,
-    [id]
+    [id],
   );
 
   if (result.rowCount === 0)

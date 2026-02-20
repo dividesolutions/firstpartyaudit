@@ -126,6 +126,114 @@ type CookieCatalogEntry = {
   match: (name: string) => boolean;
 };
 
+function cookieKey(c: { name: string; domain?: string; path?: string }) {
+  return `${c.name}|${(c.domain ?? "").toLowerCase()}|${c.path ?? "/"}`;
+}
+
+function fingerprintCookies(
+  cookies: Array<{
+    name: string;
+    value: string;
+    domain?: string;
+    path?: string;
+  }>,
+) {
+  return cookies
+    .map((c) => `${cookieKey(c)}=${c.value}`)
+    .sort()
+    .join(";");
+}
+
+async function collectCookiesUntilStable(
+  context: any,
+  opts?: { maxWaitMs?: number; stableForMs?: number; intervalMs?: number },
+) {
+  const maxWaitMs = opts?.maxWaitMs ?? 20_000;
+  const stableForMs = opts?.stableForMs ?? 2_500;
+  const intervalMs = opts?.intervalMs ?? 250;
+
+  const start = Date.now();
+  let lastFp = "";
+  let stableSince = Date.now();
+
+  while (Date.now() - start < maxWaitMs) {
+    const cookies = await context.cookies().catch(() => []);
+    const fp = fingerprintCookies(cookies);
+
+    if (fp !== lastFp) {
+      lastFp = fp;
+      stableSince = Date.now();
+    } else if (Date.now() - stableSince >= stableForMs) {
+      return cookies;
+    }
+
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+
+  return await context.cookies().catch(() => []);
+}
+
+async function handleConsentAndNudge(page: any, timeoutMs: number) {
+  // Wait a moment for CMP/UI to render
+  await page.waitForTimeout(800).catch(() => {});
+
+  // 1) Try common “accept” buttons (covers Cookiebot/OneTrust/etc.)
+  const acceptTexts = [
+    "Accept",
+    "Accept all",
+    "Allow all",
+    "I agree",
+    "Agree",
+    "OK",
+    "Got it",
+  ];
+
+  for (const t of acceptTexts) {
+    try {
+      const btn = page
+        .getByRole("button", { name: new RegExp(`^${t}$`, "i") })
+        .first();
+      if (await btn.isVisible().catch(() => false)) {
+        await btn.click({ timeout: 1500 }).catch(() => {});
+        break;
+      }
+    } catch {}
+  }
+
+  // 2) If there’s no accept, many modals just need to be closed (like your screenshot “X”)
+  // Try common close patterns
+  const closeSelectors = [
+    'button[aria-label*="close" i]',
+    'button[title*="close" i]',
+    '[data-testid*="close" i]',
+    ".close, .Close, .modal-close, .cookie-close, .onetrust-close-btn-handler",
+    'button:has-text("Close")',
+  ];
+
+  for (const sel of closeSelectors) {
+    try {
+      const el = page.locator(sel).first();
+      if (await el.isVisible().catch(() => false)) {
+        await el.click({ timeout: 1500 }).catch(() => {});
+        break;
+      }
+    } catch {}
+  }
+
+  // 3) Nudge interaction (some scripts fire after first user gesture)
+  await page.mouse.wheel(0, 900).catch(() => {});
+  await page.waitForTimeout(500).catch(() => {});
+  await page.mouse.click(20, 20).catch(() => {});
+  await page.waitForTimeout(500).catch(() => {});
+
+  // Let network settle after consent changes
+  await page
+    .waitForLoadState("networkidle", {
+      timeout: Math.min(10_000, timeoutMs),
+    })
+    .catch(() => {});
+}
+
 const COOKIE_CATALOG: CookieCatalogEntry[] = [
   // Meta
   { provider: "Meta", category: "Ads", match: (n) => n === "_fbp" },
@@ -504,6 +612,7 @@ async function capturePass(
   const start = Date.now();
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+    await handleConsentAndNudge(page, timeoutMs);
     await page.waitForTimeout(1500);
   } catch (e: any) {
     notes.push(
@@ -523,8 +632,21 @@ async function capturePass(
 
   let contextCookies: ContextCookie[] = [];
   try {
-    const raw = await context.cookies();
-    contextCookies = raw.map((c) => ({
+    // Give analytics/consent stacks time to set late cookies (GA/Meta/etc.)
+    await page
+      .waitForLoadState("networkidle", {
+        timeout: Math.min(10_000, timeoutMs),
+      })
+      .catch(() => {});
+
+    // Wait until cookie jar stops changing for a short window (best-effort, capped)
+    const raw = await collectCookiesUntilStable(context, {
+      maxWaitMs: 20_000,
+      stableForMs: 2_500,
+      intervalMs: 250,
+    });
+
+    contextCookies = raw.map((c: any) => ({
       name: c.name,
       value: c.value,
       domain: c.domain,

@@ -9,18 +9,10 @@ const { Pool } = pg;
 const app = Fastify({ logger: true });
 
 await app.register(cors, {
-  origin: (origin, cb) => {
-    const allowed = ["http://localhost:5173", "https://track.gofirstparty.com"];
-
-    if (!origin) return cb(null, true);
-
-    if (allowed.includes(origin)) {
-      cb(null, true);
-    } else {
-      cb(null, false); // important: don't throw error
-    }
-  },
-  credentials: false,
+  origin: ["https://track.gofirstparty.com", "http://localhost:5173"],
+  methods: ["GET", "POST", "PATCH", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+  credentials: false, // set true only if you're using cookies
 });
 
 const DATABASE_URL = process.env.DATABASE_URL;
